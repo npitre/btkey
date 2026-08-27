@@ -1,0 +1,95 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Run the test files one at a time, saying so as it goes.
+
+Two silences to avoid.  `make check` said nothing for twenty seconds and
+then "tests pass", which is indistinguishable from a hang; unittest's own
+output is a stream of dots that says nothing about which file is running.
+
+A line per file, printed as that file finishes, is the shape that reads on
+a braille display: no spinner, no cursor tricks, nothing rewritten after
+the fact.  The elapsed time is shown for the slow ones, since a pause with
+no explanation is the thing being fixed.
+"""
+
+import glob
+import os
+import re
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SLOW = 1.0          # seconds, above which the time is worth saying
+
+
+def say(line):
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()          # or nothing appears until the end
+
+
+def plural(count, word):
+    return "%d %s%s" % (count, word, "" if count == 1 else "s")
+
+
+def interesting(output):
+    """The part of a unittest run that says what went wrong.
+
+    Its report puts the failures after a row of equals signs, below
+    whatever the tests printed on the way.  Showing the lot means reading
+    past every test that passed to reach the one that did not, which on a
+    braille display is a real cost rather than a scroll.
+    """
+    marker = re.search(r"^={20,}$", output, re.M)
+    return output[marker.start():].rstrip() if marker else output.rstrip()
+
+
+def main(argv):
+    wanted = argv or sorted(glob.glob(os.path.join(HERE, "test_*.py")))
+    if not wanted:
+        say("no tests found in %s" % HERE)
+        return 1
+
+    width = max(len(os.path.basename(path)) for path in wanted)
+    total, failures = 0, []
+    started = time.monotonic()
+
+    for path in wanted:
+        name = os.path.basename(path)
+        began = time.monotonic()
+        result = subprocess.run([sys.executable, path],
+                                capture_output=True, text=True)
+        took = time.monotonic() - began
+
+        output = result.stderr + result.stdout
+        found = re.search(r"^Ran (\d+) test", output, re.M)
+        count = int(found.group(1)) if found else 0
+        total += count
+
+        elapsed = "  %.1fs" % took if took >= SLOW else ""
+        if result.returncode == 0:
+            say("  %-*s  %4d ok%s" % (width, name, count, elapsed))
+        else:
+            failures.append((name, output))
+            say("  %-*s  %4d FAILED%s" % (width, name, count, elapsed))
+
+    say("")
+    for name, output in failures:
+        say("--- %s ---" % name)
+        for line in interesting(output).splitlines():
+            say("  " + line)
+        say("")
+
+    overall = time.monotonic() - started
+    if failures:
+        say("%d of %s failed, %s in %.1fs"
+            % (len(failures), plural(len(wanted), "file"),
+               plural(total, "test"), overall))
+        return 1
+    say("%s in %s, all passed, %.1fs"
+        % (plural(total, "test"), plural(len(wanted), "file"), overall))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

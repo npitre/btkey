@@ -1,0 +1,154 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Show where keystrokes arrive: the input subsystem, or the console.
+
+btkey has two ways in.  Keys from evdev are forwarded as key positions;
+text arriving on the console is looked up in the keymap and typed as the
+positions that would produce those characters.  A key that works one way
+and not the other says which path it took, and that is not something the
+code can tell from the outside.
+
+Run this with btkey stopped - a device btkey has grabbed delivers to btkey
+and to nobody else, so nothing would show up here.
+
+    sudo tools/btkey-trace-input
+
+Then type.  Ctrl+C to stop.
+"""
+
+import os
+import select
+import sys
+import termios
+
+# An installation rewrites this to wherever the package was put.  Empty
+# means a checkout, where it sits next to bin/.
+LIBDIR = ""
+
+sys.path.insert(0, LIBDIR or os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__))))
+
+from btkey import evdev, keycodes
+
+NAMES = {
+    1: "Escape", 14: "Backspace", 15: "Tab", 28: "Enter", 57: "Space",
+    58: "CapsLock", 96: "KpEnter", 102: "Home", 103: "Up", 104: "PageUp",
+    105: "Left", 106: "Right", 107: "End", 108: "Down", 109: "PageDown",
+    110: "Insert", 111: "Delete", 119: "Pause",
+    # The keys a keyboard puts behind Fn, which is what anyone hunting for
+    # its media functions is pressing.
+    113: "Mute", 114: "VolumeDown", 115: "VolumeUp", 116: "Power",
+    128: "Stop", 140: "Calculator", 142: "Sleep", 143: "WakeUp",
+    150: "WWW", 155: "Mail", 158: "Back", 159: "Forward",
+    163: "NextSong", 164: "PlayPause", 165: "PreviousSong", 166: "StopCD",
+    167: "Record", 168: "Rewind", 172: "HomePage", 173: "Refresh",
+    206: "Close", 207: "Play", 208: "FastForward", 212: "Camera",
+    217: "Search", 224: "BrightnessDown", 225: "BrightnessUp",
+    226: "Media", 227: "SwitchVideoMode", 228: "KbdIllumToggle",
+}
+
+FUNCTION_KEYS = {59: "F1", 60: "F2", 61: "F3", 62: "F4", 63: "F5", 64: "F6",
+                 65: "F7", 66: "F8", 67: "F9", 68: "F10", 87: "F11",
+                 88: "F12"}
+NAMES.update(FUNCTION_KEYS)
+
+
+def key_name(keycode):
+    if keycode in NAMES:
+        return NAMES[keycode]
+    return "keycode %d" % keycode
+
+
+def forwarding(keycode):
+    """What btkey would send to the phone for this key, if anything.
+
+    A key can go out on either of two HID pages and the difference
+    matters: iOS acts on much of the consumer page and ignores most of the
+    keyboard page's function row, which is the whole reason for looking.
+    """
+    if keycode in keycodes.KEYBOARD:
+        return "keyboard 0x%02X" % keycodes.KEYBOARD[keycode]
+    if keycode in keycodes.CONSUMER:
+        return "consumer 0x%04X" % keycodes.CONSUMER[keycode]
+    return "nothing"
+
+
+def describe_bytes(data):
+    out = []
+    for byte in data:
+        if byte == 0x1B:
+            out.append("ESC")
+        elif byte == 0x7F:
+            out.append("DEL(0x7f)")
+        elif byte < 0x20:
+            out.append("^%s" % chr(byte + 64))
+        elif byte < 0x7F:
+            out.append(chr(byte))
+        else:
+            out.append("0x%02x" % byte)
+    return " ".join(out)
+
+
+def main():
+    devices = evdev.discover()
+    if not devices:
+        sys.stderr.write("no keyboards found; run me as root\n")
+        return 1
+
+    print("Watching, without grabbing:")
+    for device in devices:
+        print("  %-24s %s" % (device.path, device.name))
+    print()
+    print("Press anything, on any of them, including whatever the keyboard")
+    print("hides behind its Fn key.  Each line says what btkey would send to")
+    print("the phone for that key: a keyboard-page usage, a consumer-page")
+    print("one, or nothing.  A key reaching the console rather than the")
+    print("input subsystem shows as 'console'; one that shows up as neither")
+    print("is being swallowed before either.")
+    print("Ctrl+C to stop.")
+    print()
+
+    saved = None
+    if os.isatty(0):
+        saved = termios.tcgetattr(0)
+        raw = termios.tcgetattr(0)
+        raw[3] &= ~(termios.ECHO | termios.ICANON)
+        raw[6][termios.VMIN] = 0
+        raw[6][termios.VTIME] = 0
+        termios.tcsetattr(0, termios.TCSANOW, raw)
+
+    by_fd = {device.fd: device for device in devices}
+    try:
+        while True:
+            watching = list(by_fd) + ([0] if saved is not None else [])
+            ready, _, _ = select.select(watching, [], [])
+            for fd in ready:
+                if fd == 0:
+                    data = os.read(0, 4096)
+                    if data == b"\x03":
+                        return 0
+                    print("console  %s" % describe_bytes(data), flush=True)
+                    continue
+                device = by_fd[fd]
+                events = device.read_keys()
+                if events is None:
+                    del by_fd[fd]
+                    continue
+                for keycode, is_press in events:
+                    if not is_press:
+                        continue        # one line per key, not two
+                    print("evdev    %-20s %-16s -> %s"
+                          % (device.name[:20], key_name(keycode),
+                             forwarding(keycode)),
+                          flush=True)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        if saved is not None:
+            termios.tcsetattr(0, termios.TCSANOW, saved)
+        for device in devices:
+            device.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

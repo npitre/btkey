@@ -1,0 +1,255 @@
+# What btkey does to the machine
+
+**btkey needs no system configuration.**  `sudo btkey` works on a stock
+machine, and nothing it changes there outlasts it: the files it writes are
+its own, listed below.  This describes what it does while it is running,
+and the one permanent alternative.
+
+For btkey's own settings (which layout to use, how to pair) see
+`examples/btkey.conf.example` and `btkey --help`.
+
+## bluetoothd
+
+BlueZ ships an `input` plugin implementing the HID *host* role, so the
+machine can drive Bluetooth keyboards and mice.  That plugin registers UUID
+`0x1124` and binds L2CAP PSM 17 and 19 at startup.
+
+btkey needs to be the HID *device* on the same controller, which means
+owning that same UUID and those same PSMs.  There is no way to share them:
+with the plugin loaded, registering the profile fails with
+
+```
+org.bluez.Error.NotPermitted: UUID already registered
+```
+
+and binding the PSMs fails with `EADDRINUSE`.
+
+So on startup btkey stops `bluetooth.service`, remembering whether it was
+running, and starts `bluetoothd --nodetach --noplugin=input` in its place.
+On exit it terminates that and starts the unit again.  The private daemon
+reads the same `/etc/bluetooth/main.conf`; nothing under `/etc` is written
+at any point.
+
+While btkey runs, the machine cannot use Bluetooth input devices of its
+own: no Bluetooth keyboard, mouse, or braille display.  That reverts the
+moment btkey exits.
+
+Older guides say to put `DisablePlugins = input` in `main.conf`.  That is
+BlueZ 4 syntax and has no effect on BlueZ 5.
+
+Only one btkey can do this, so only one may run.  A second would find
+`org.bluez` taken, fail to start its own daemon, and in undoing itself
+start `bluetooth.service` underneath the one already running.  It takes a
+lock on `/run/btkey/lock` before touching anything and says who has it
+instead.
+
+## Class of device
+
+The class says what kind of device this is, and a phone reads it to decide
+whether to offer the machine as a keyboard and as somewhere to send sound.
+bluetoothd derives the service class bits from the registered profile
+UUIDs, and its table maps Headset and Handsfree to **Audio** while A2DP
+maps only to Rendering and Capturing, so offering media audio without call
+audio leaves the one bit a phone looks for switched off.
+
+Nothing in the D-Bus API exposes those bits, and `main.conf`'s `Class` is
+not honoured either: a run with `Class = 0x000540` in it left the adapter at
+the default `0x0c0104`.  So btkey writes the class with the
+`HCI_Write_Class_of_Device` command directly, and puts it back whenever
+bluetoothd recomputes it, which it does on every change to the UUID set,
+three times inside one second during a WirePlumber restart.
+
+`--class` sets the major and minor bits.  Without `--audio=on` the audio
+bits are not set at all, and the `a2dp` and `avrcp` plugins are dropped
+with them.
+
+**iOS caches all of this when it pairs and never looks again**, so changing
+either the class or the profile set means forgetting the device on the phone
+and pairing afresh.  btkey notices when what it advertises has moved since
+the last run and says so.
+
+## Bluetooth audio, without call audio
+
+Once a phone has bonded it can also use the machine as a speaker, which is
+useful: VoiceOver comes out of the PC's headphones rather than the phone's
+speaker.  Call audio is a different matter: HFP and HSP would let the phone
+decide this machine is where a phone call should go.
+
+Those are not bluetoothd's to withhold.  WirePlumber registers them through
+`org.bluez.ProfileManager1`, so `--noplugin` cannot touch them.  They are
+dropped with a WirePlumber drop-in instead: `examples/50-no-hfp.conf`,
+which belongs in `~/.config/wireplumber/wireplumber.conf.d/`:
+
+```
+monitor.bluez.properties = {
+  bluez5.roles = [ a2dp_sink bap_sink bap_source ]
+  bluez5.hfphsp-backend = none
+}
+```
+
+`a2dp_source` is dropped there too.  It is what lets *this* machine play out
+to a Bluetooth headset, which has nothing to do with the phone-to-PC
+direction; put it back in the list if this machine ever needs Bluetooth
+headphones of its own.
+
+Doing this costs the `Audio` bit in the class of device, since bluetoothd
+derives that from the profile UUIDs and only Headset and Handsfree map to
+it.  btkey puts the bit back itself (see above) so the phone still offers
+the machine as a place to send sound.  [DESIGN.md](DESIGN.md) has the whole
+story; it took three rounds to work out.
+
+### Asking for the audio channel
+
+Pairing a keyboard and routing audio are separate decisions to a phone,
+and it makes the second one by connecting a second profile.  It does not
+always make it: after a fresh bond iOS connects HID and stops there, so
+this machine advertises somewhere to send sound and nothing ever asks it
+to.  Everything else is in place at that point, the class of device and
+WirePlumber's A2DP Sink endpoints both, and the audio simply does not
+arrive with nothing anywhere saying why.
+
+So with `--audio=on`, a few seconds after the keyboard connects, btkey
+asks the phone to connect its A2DP Source profile as well and logs what
+came back.  A few seconds because asking in the same breath is refused as
+busy, and a refusal costs nothing but the audio.
+
+## Keyboards
+
+btkey holds an `EVIOCGRAB` on every keyboard while its console is in the
+foreground, and lets go the instant it is not.  `btkey --list-devices`
+shows what it would take:
+
+```
+/dev/input/event0      -      Power Button
+/dev/input/event1      grab   AT Translated Set 2 keyboard
+/dev/input/event5      grab   Some USB keyboard
+/dev/input/event6      grab   Some USB keyboard Consumer Control
+/dev/input/event7      -      Some USB keyboard System Control
+/dev/input/event4      grab   BRLTTY Linux Screen Driver Keyboard
+```
+
+A device qualifies only if it can produce the whole letter block plus Enter
+and Space.  That admits real keyboards and BRLTTY's uinput injector, which
+is what makes pasting reach the phone, while leaving the power button, the
+ACPI video bus and the lid switch alone, none of which should be taken away
+from the local machine.  `--device PATH` adds anything the filter misses.
+
+A keyboard usually presents more than one device: the letters on one, the
+volume and media keys on another that cannot pass that test.  Those are
+taken as well when they share a physical path with a keyboard that did,
+since they are the same keyboard, and otherwise their keys would go on
+working here while btkey has the rest of it.  Not the System Control
+interface, though: it carries Power, Sleep and Wake, which belong to this
+machine, and grabbing it would leave the power key doing nothing.
+
+Nothing here needs cleanup: the grab is a property of the open file
+description, so the kernel drops it when btkey exits, however it exits.
+
+### Which way a key came in
+
+Keys reach btkey two ways, and they are not equivalent.  From evdev they
+are forwarded as *key positions*, so any key works whether or not it
+produces a character.  From the console they arrive as *text*, and have to
+be turned back into positions: printable characters by looking them up in
+the keymap, control codes by name, and keys that produce no character at
+all (the arrows, Home, End, Delete) by decoding the escape sequence they
+arrive as.
+
+**BRLTTY's braille keyboard takes the second path.**  Its uinput device
+carries the keys of a physical keyboard, but braille typing is written to
+the console as text, so on a braille display everything goes through the
+decoding above.  That is measured rather than assumed:
+`sudo btkey-trace-input`, run with btkey stopped, watches both paths
+at once and labels each keystroke with the one it came in on.  Stopped,
+because a device btkey has grabbed delivers to btkey and to nobody else.
+
+It is worth having when a key does nothing, because btkey cannot report
+that by itself: a key that never arrives looks exactly like a key that was
+never pressed.
+
+## The console
+
+The console is split with `DECSTBM`, as apt's fancy progress does it: rows
+1..n-1 scroll, row n is reserved for the current important message, and the
+cursor is parked on that message's first character.  BRLTTY tracks the
+cursor, so the braille display ends up on the start of the text without the
+reader having to hunt for it, and a reserved line cannot scroll out from
+under it.
+
+Two consequences worth knowing:
+
+* `DECSTBM` homes the cursor on the Linux console, so btkey positions it
+  explicitly afterwards rather than relying on where it lands.
+* Nothing in the kernel undoes a scrolling region.  btkey resets it on exit,
+  and the guardian resets it if btkey is killed, reaching the VT through
+  `/dev/ttyN` rather than stdout, since under sudo that stdout is a pty that
+  dies along with the process.  A console left with a frozen bottom line is
+  otherwise a puzzle; `printf '\033[r'` or `reset` is the manual fix.
+
+Time-critical prompts, the pairing dialogs, also write `\a`.  BRLTTY
+monitors the console bell, so those arrive as an audible cue without btkey
+producing any audio itself.
+
+Everything btkey prints also goes to `/run/btkey/log`, timestamped and
+without the escape sequences, which is the only copy that can be read after
+the fact.  From a checkout that happens by default; an installed btkey
+writes nothing unless `--log-file` asks it to.
+
+## Text, and why it needs a layout
+
+btkey is otherwise entirely layout-agnostic: keys arrive as positions and
+leave as positions, and the phone applies the layout.  Text is the
+exception, because BRLTTY delivers it as characters through `TIOCSTI`
+rather than as key events, so btkey has to work out which key produces
+each one.
+
+Without a measured layout it falls back to inverting the console keymap
+with `KDGKBENT`, which is only right where the console and the phone agree,
+and they need not.  Measuring the phone is the answer;
+[LAYOUTS.md](LAYOUTS.md) is the procedure.
+
+## Files
+
+| Path | What it is |
+| ---- | ---------- |
+| `/run/btkey/lock` | held while btkey runs, so a second one refuses to start |
+| `/run/btkey/log` | everything btkey printed, timestamped; mode 0600, since a displayed passkey goes through it.  Only from a checkout: an installed btkey writes no log unless `--log-file` asks |
+| `/run/btkey/control` | write commands here; `btkey --learn-layout`, `--quit` and friends do |
+| `/var/lib/btkey/host` | the last host that paired, so a key press can dial it |
+| `/var/lib/btkey/advertised` | what was last advertised, to notice when it changes |
+
+The control FIFO is handed to whoever invoked the sudo, so `btkey
+--learn-layout` and friends work without a second one, and to nobody else.
+It is set to mode 0600 on every start, not only when btkey creates it, since
+one left behind by an earlier run keeps whatever mode that run left it with;
+and the result is checked with `fstat` after opening rather than assumed.
+If it is reachable by anyone else, btkey says so and does not listen on it,
+which costs the learn commands and nothing else.
+
+That check is worth its few lines because anything able to write there
+causes keystrokes on a phone.  It is a narrow channel (the commands take
+key positions, not text, so it cannot spell arbitrary things) and a loud
+one, since a probe takes seconds, shows a percentage and rings the bell.
+But narrow and loud is not the same as closed.
+
+Text can only be typed from the console btkey was started on.  There was
+once a FIFO for it as well, which anything running as the same user could
+write to: a keystroke injector into someone's phone, with nothing to say
+where the text came from.  Reading only from that console means the text
+has to come from someone sitting at it.
+
+## The permanent alternative
+
+```
+sudo btkey-system-bluetoothd
+sudo btkey --system-bluetoothd
+```
+
+This installs a `bluetooth.service` drop-in running
+`bluetoothd --noplugin=input`, and tells btkey to use the running daemon
+rather than starting its own.  The upside is a marginally faster start and
+no bluetoothd restarts.  The cost is that **the machine permanently loses
+the Bluetooth HID host role**, whether or not btkey is running.  Prefer the
+default unless there is a specific reason.
+
+`sudo btkey-system-bluetoothd --undo` reverts it.

@@ -1,0 +1,39 @@
+# btkey configuration.
+#
+# Copy to ~/.config/btkey/btkey.conf - the config directory of whoever runs
+# the sudo, not root's - or to /etc/btkey/btkey.conf for the whole machine.
+# The first that exists is used; --config points somewhere else, --no-config
+# ignores both.
+#
+# Each line is an option from `btkey --help`, written without the dashes.
+# Anything typed on the command line wins over anything here.
+
+# The phone's keyboard layout, measured with --learn-layout and built with
+# --build-layout.  Without it, pasting falls back to the console keymap,
+# which is wrong wherever the phone disagrees with it.
+#phone-layout = ~/.config/btkey/iphone-fr-ca.conf
+
+# The name the phone shows in its Bluetooth list.
+#name = btkey
+
+# What the F1 to F12 row sends: auto, the default, asks the host when it
+# connects and sends media keys to an Apple one and F1 to F12 to anything
+# else.  function and media settle it by hand.
+#top-row = media
+
+# Pairing style: confirm, keyboard, display or justworks.  confirm shows
+# matching digits on both ends with nothing to type.
+#pairing = confirm
+
+# A copy of everything btkey says, which a checkout writes by default and
+# an installation does not.  An empty value turns it off wherever it would
+# otherwise be on.
+#log-file = /run/btkey/log
+#log-file =
+
+# Switches take yes, no, on, off, true or false, and are named positively:
+# audio, never no-audio nor with-audio.  Anything typed on the command line
+# wins, so --audio=off answers audio = on without editing this file.
+#audio = on
+#reconnect = no
+#debug = yes

@@ -1,0 +1,87 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Configure the *system* bluetoothd for btkey, permanently.
+#
+#   btkey-system-bluetoothd            apply
+#   btkey-system-bluetoothd --undo     revert
+#
+# You almost certainly do not need this.  By default btkey runs its own
+# bluetoothd for its own lifetime and hands org.bluez back on exit, so
+# nothing under /etc is touched and the machine keeps working normally with
+# Bluetooth keyboards, mice and braille displays whenever btkey is not
+# running.
+#
+# This script is the alternative for anyone who would rather configure the
+# system daemon once and run `btkey --system-bluetoothd` thereafter.  It:
+#
+#   1. installs a bluetooth.service drop-in running bluetoothd --noplugin=input
+#
+# That is all it does.  It used to set Class in main.conf as well; that turns
+# out not to be honoured - a run with Class = 0x000540 in it left the adapter
+# at the default - so btkey writes the class with an HCI command instead,
+# which works either way.
+#
+# The cost is permanent: the machine loses the Bluetooth HID *host* role, so
+# no Bluetooth keyboard, mouse or braille display will work on it, whether or
+# not btkey is running.
+
+set -euo pipefail
+
+DROPIN_DIR=/etc/systemd/system/bluetooth.service.d
+DROPIN=$DROPIN_DIR/btkey.conf
+MAIN_CONF=/etc/bluetooth/main.conf
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "btkey-system-bluetoothd: must run as root" >&2
+    exit 1
+fi
+
+apply() {
+    install -d -m 0755 "$DROPIN_DIR"
+    cat > "$DROPIN" <<'DROPIN_EOF'
+# Drop-in for bluetooth.service, installed by btkey-system-bluetoothd.
+#
+# bluetoothd's `input` plugin implements the HID *host* role: it claims UUID
+# 0x1124 and binds L2CAP PSM 17 and 19 so the machine can talk to Bluetooth
+# keyboards and mice.  btkey needs to be the HID *device* on the same
+# controller, which means owning that UUID and those PSMs itself.  The two
+# cannot coexist, so the plugin goes.
+#
+# Cost: while this is in place, this machine can no longer act as a host for
+# Bluetooth input devices - keyboards, mice, or a Bluetooth braille display.
+# Bluetooth audio, networking and everything else are unaffected.
+[Service]
+ExecStart=
+ExecStart=/usr/libexec/bluetooth/bluetoothd --noplugin=input
+DROPIN_EOF
+    chmod 0644 "$DROPIN"
+    echo "installed $DROPIN"
+
+
+    systemctl daemon-reload
+    systemctl restart bluetooth.service
+    echo
+    echo "The system bluetoothd now runs without its input plugin, so this"
+    echo "machine can no longer use Bluetooth keyboards, mice or braille"
+    echo "displays.  Run btkey --system-bluetoothd from now on."
+}
+
+undo() {
+    rm -f "$DROPIN"
+    rmdir --ignore-fail-on-non-empty "$DROPIN_DIR" 2>/dev/null || true
+    # Nothing writes this any more, but an earlier version of this script
+    # did, so undo has to clean up after it.
+    if [ -f "$MAIN_CONF.btkey-orig" ]; then
+        mv "$MAIN_CONF.btkey-orig" "$MAIN_CONF"
+        echo "restored $MAIN_CONF"
+    fi
+    systemctl daemon-reload
+    systemctl restart bluetooth.service
+    echo "system bluetoothd restarted with its input plugin back"
+}
+
+case "${1:-}" in
+    --undo|-u) undo ;;
+    "")        apply ;;
+    *) echo "usage: btkey-system-bluetoothd [--undo]" >&2; exit 1 ;;
+esac

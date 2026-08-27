@@ -1,0 +1,18 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Entry point; runnable straight from a checkout, or installed."""
+
+import os
+import sys
+
+# An installation rewrites this to wherever the package was put.  Empty
+# means a checkout, where it sits next to bin/.
+LIBDIR = ""
+
+sys.path.insert(0, LIBDIR or os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__))))
+
+from btkey.cli import main
+
+if __name__ == "__main__":
+    sys.exit(main())
