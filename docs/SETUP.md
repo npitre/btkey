@@ -122,11 +122,17 @@ shows what it would take:
 ```
 /dev/input/event0      -      Power Button
 /dev/input/event1      grab   AT Translated Set 2 keyboard
-/dev/input/event5      grab   Some USB keyboard
+/dev/input/event5      held   Some USB keyboard
 /dev/input/event6      grab   Some USB keyboard Consumer Control
 /dev/input/event7      -      Some USB keyboard System Control
 /dev/input/event4      grab   BRLTTY Linux Screen Driver Keyboard
 ```
+
+`grab` is a device btkey would take, `held` one another program has, and
+`-` one it leaves alone.  Finding out costs a grab and an immediate
+release, since nothing in `/proc` or `/sys` says who holds one; run it
+while btkey is running and everything btkey has shows as `held`, by
+btkey.
 
 A device qualifies only if it can produce the whole letter block plus Enter
 and Space.  That admits real keyboards and BRLTTY's uinput injector, which
@@ -144,6 +150,67 @@ machine, and grabbing it would leave the power key doing nothing.
 
 Nothing here needs cleanup: the grab is a property of the open file
 description, so the kernel drops it when btkey exits, however it exits.
+
+### When a keyboard will not come
+
+The kernel keeps one grab per device: `input_grab_device` refuses a second
+with `EBUSY`, and while a grab is held `input_pass_values` delivers to the
+holder alone and to no other handler.  That is what makes the grab worth
+taking, and it is also why two programs cannot share one: there is no
+arrangement where both get a copy.
+
+The same holds one level down, between two programs sharing the evdev
+node: `evdev_events` passes to the grabbing client alone, or to every open
+descriptor when there is no grab.  So a hotkey daemon holding a keyboard
+does not merely stop btkey taking it, it stops btkey seeing anything from
+it: btkey has the device open and reads nothing.
+
+What happens to those keys is then entirely the holder's business.  A
+daemon that swallows what it wants and replays the rest through `uinput`
+leaves a second, virtual keyboard for btkey to find and grab, and typing
+works normally through that; one that replays nothing leaves the keyboard
+doing only whatever that daemon does with it.
+
+BRLTTY does exactly the first when it is set up to put braille commands on
+the ordinary keyboard, and the listing shows the whole arrangement:
+
+```
+/dev/input/event1      held   AT Translated Set 2 keyboard
+/dev/input/event4      grab   BRLTTY 6.9.1 Keyboard Instance - event5
+/dev/input/event5      held   CM Storm QuickFire Rapid keyboard
+/dev/input/event6      grab   CM Storm QuickFire Rapid keyboard Consumer Control
+/dev/input/event14     grab   BRLTTY 6.9.1 Keyboard Instance - event1
+```
+
+Both real keyboards are BRLTTY's, and each has an instance beside it
+carrying what BRLTTY did not keep.  btkey takes the instances, so it gets
+those keys as key positions, and the braille commands never reach it,
+which is right: they were meant for BRLTTY.
+
+Whatever holds it may let go later.  The grab is retried on every return
+to the foreground, and both the refusal and the eventual success are
+reported under `--debug`, since a keyboard that quietly changes which of
+the two paths it takes is indistinguishable from btkey misbehaving.  Only
+under `--debug`, because a machine with BRLTTY or a hotkey daemon on it
+has something sitting on a device every session and nothing is wrong;
+naming them on a console that is a few lines of braille would be noise.
+
+The exception is no keyboard coming at all, which is said plainly.  btkey
+with nothing to read looks exactly like a phone that has stopped
+listening, and those are chased in entirely different places.
+
+### Noticing a keyboard arriving
+
+A keyboard plugged in while btkey is running is picked up without it,
+because the `/dev/input` directory is watched rather than looked at every
+so often.  The short wait before looking matters as much as the watch: the
+node appears before udev has given it its ownership and mode, so a look
+the instant it is created finds something btkey is not allowed to open,
+and one keyboard arrives as a burst of several nodes.
+
+A keyboard that arrives while another console has the screen is left alone
+until the switch back, which is also when the set is looked at afresh:
+what is plugged in can change while btkey is not the one being typed at.
 
 ### Which way a key came in
 

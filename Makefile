@@ -32,7 +32,7 @@ MODULES = $(wildcard btkey/*.py)
 LAUNCHERS = bin/btkey tools/btkey-trace-input tools/btkey-system-bluetoothd
 EXAMPLES = $(wildcard examples/*)
 LAYOUTS = $(wildcard layouts/*)
-DOCS = README.md $(wildcard docs/*.md)
+DOCS = README.md CHANGES.md $(wildcard docs/*.md)
 
 .PHONY: help check install uninstall
 

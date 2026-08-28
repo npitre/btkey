@@ -55,6 +55,10 @@ def _ioc(direction, letter, number, size):
     return (direction << 30) | (size << 16) | (ord(letter) << 8) | number
 
 
+# Where the kernel puts event devices, and what to watch for one arriving.
+DEVICE_DIRECTORY = "/dev/input"
+DEVICE_GLOB = DEVICE_DIRECTORY + "/event*"
+
 EVIOCGRAB = _ioc(_IOC_WRITE, "E", 0x90, 4)
 EVIOCGNAME = _ioc(_IOC_READ, "E", 0x06, 256)
 EVIOCGPHYS = _ioc(_IOC_READ, "E", 0x07, 256)
@@ -97,6 +101,10 @@ class InputDevice:
             self.writable = False
         self.name = self._name()
         self.phys = self._phys()
+        # Set when a grab was refused, so that the refusal is reported once
+        # rather than on every console switch, and so is coming free again.
+        self.refused = False
+        self.grab_error = None
         self.keybits = self._keybits()
         self.has_leds = self._has_leds()
         self.grabbed = False
@@ -174,12 +182,23 @@ class InputDevice:
         return any(self.has_key(code) for code in keycodes.CONSUMER)
 
     def grab(self):
+        """Take the device exclusively.  False, and why, if it will not come.
+
+        The kernel keeps one grab per device: `input_grab_device` refuses
+        with EBUSY when `dev->grab` is already set.  So a refusal is nearly
+        always somebody else holding it rather than anything about us, but
+        not always - the device can also have gone away - and saying the
+        wrong one of those sends whoever reads it looking in the wrong
+        place.
+        """
         if self.grabbed:
             return True
         try:
             fcntl.ioctl(self.fd, EVIOCGRAB, 1)
-        except OSError:
+        except OSError as exc:
+            self.grab_error = exc.errno
             return False
+        self.grab_error = None
         self.grabbed = True
         return True
 
@@ -268,7 +287,7 @@ def discover(extra_paths=()):
     # first, fail the keyboard test, and drop the request silently.
     wanted = {os.path.realpath(path) for path in extra_paths}
     devices, spare, seen = [], [], set()
-    for path in list(extra_paths) + sorted(glob.glob("/dev/input/event*")):
+    for path in list(extra_paths) + sorted(glob.glob(DEVICE_GLOB)):
         real = os.path.realpath(path)
         if real in seen:
             continue
@@ -303,11 +322,19 @@ class KeyboardSet:
     the state missing.
     """
 
-    def __init__(self, extra_paths=(), on_event=None):
+    def __init__(self, extra_paths=(), on_event=None, on_debug=None):
         self.extra_paths = list(extra_paths)
         self.event = on_event or (lambda message: None)
+        # Which keyboards came and which did not is worth saying only when
+        # it is a problem.  Where another program deliberately holds a
+        # keyboard and hands the keys back through one of its own - which
+        # is what BRLTTY does when braille commands go on the ordinary
+        # keyboard - a refusal at every start reads like a fault and is
+        # not one.
+        self.debug = on_debug or (lambda message: None)
         self.devices = {}
         self.grabbed = False
+        self.empty_handed = False
 
     def refresh(self):
         """Rescan for hotplugged keyboards.  Returns (added, removed)."""
@@ -323,9 +350,9 @@ class KeyboardSet:
                 # Snapshot before grabbing, as grab_all does, or this one
                 # keeps the phone's lock state when the grab is released.
                 device.saved_leds = device.leds()
-                if not device.grab():
-                    self.event("could not grab %s (%s); another program "
-                               "holds it" % (device.name, path))
+                # If it will not come, grab_all says so, in its own words
+                # and only once; the caller runs it straight after this.
+                device.grab()
             added.append(device)
 
         removed = [self.devices.pop(path)
@@ -337,13 +364,48 @@ class KeyboardSet:
         device.close()
 
     def grab_all(self):
+        """Take every keyboard, and say which ones would not come.
+
+        A refusal is reported once, and so is a later success: another
+        program holding a device may let go between one console switch and
+        the next, and a keyboard that quietly starts or stops reaching the
+        phone is the whole of what "flaky" means from the outside.
+        """
         self.grabbed = True
+        held = 0
         for device in self.devices.values():
             if device.saved_leds is None:
                 device.saved_leds = device.leds()
-            if not device.grab():
-                self.event("could not grab %s; another program holds it"
-                           % device.name)
+            if device.grab():
+                held += 1
+                if device.refused:
+                    device.refused = False
+                    self.debug("%s came free; btkey has it now"
+                               % device.name)
+            elif not device.refused:
+                device.refused = True
+                if device.grab_error == errno.EBUSY:
+                    self.debug("could not grab %s; another program holds "
+                               "it, so nothing from it reaches btkey at all "
+                               "and whatever holds it decides what its keys "
+                               "do" % device.name)
+                else:
+                    self.debug("could not grab %s: %s"
+                               % (device.name,
+                                  os.strerror(device.grab_error or 0)))
+
+        # One keyboard of several being somebody else's is ordinary and is
+        # left to --debug.  Not one of them coming is not ordinary: btkey
+        # is then running with no keyboard at all, and saying nothing about
+        # it would leave a dead keyboard looking like a dead phone.
+        if self.devices and not held:
+            if not self.empty_handed:
+                self.empty_handed = True
+                self.event("no keyboard could be grabbed; nothing typed "
+                           "will reach the phone (--debug says why)")
+        elif self.empty_handed:
+            self.empty_handed = False
+            self.event("a keyboard came free; typing reaches the phone again")
 
     def held_keys(self):
         """Every key physically down across all keyboards."""

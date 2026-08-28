@@ -21,16 +21,52 @@ from .session import Session, started_by
 
 
 def list_devices(extra_paths):
-    for path in sorted(glob.glob("/dev/input/event*")):
+    """What is there, and which of it btkey could actually have.
+
+    Whether a device is free is not visible any other way: nothing in
+    /proc or /sys says who holds a grab, so the only way to find out is to
+    ask for it and give it straight back.  Worth the asking, because
+    "qualifies as a keyboard" and "btkey can use it" are different
+    questions and this used to answer only the first - so a keyboard held
+    by a hotkey daemon was listed as one btkey would take.
+    """
+    # Asking discover() rather than repeating part of it.  This used to
+    # test only whether a device looked like a keyboard, so the second
+    # interface a keyboard keeps its media keys on - which btkey does take,
+    # as a companion - was listed as one it would leave alone.
+    chosen = {os.path.realpath(device.path): device
+              for device in evdev.discover(extra_paths)}
+    for path in sorted(glob.glob("/dev/input/event*"), key=event_number):
+        device = chosen.get(os.path.realpath(path))
+        if device is not None:
+            print("%-22s %-6s %s" % (path, grab_state(device), device.name))
+            continue
         try:
-            device = evdev.InputDevice(path)
+            other = evdev.InputDevice(path)
         except OSError as exc:
             print("%-22s %s" % (path, exc.strerror))
             continue
-        mark = "grab" if (device.is_keyboard() or path in extra_paths) else "-"
-        print("%-22s %-6s %s" % (path, mark, device.name))
+        print("%-22s %-6s %s" % (path, "-", other.name))
+        other.close()
+    for device in chosen.values():
         device.close()
     return 0
+
+
+def event_number(path):
+    """Sort event9 before event10, which sorting by name does not."""
+    digits = "".join(c for c in os.path.basename(path) if c.isdigit())
+    return (int(digits) if digits else -1, path)
+
+
+def grab_state(device):
+    """Take the device for an instant, to see whether it can be taken."""
+    if device.grab():
+        device.ungrab()
+        return "grab"
+    if device.grab_error == errno.EBUSY:
+        return "held"
+    return os.strerror(device.grab_error or 0)
 
 
 #: Control-FIFO command for each thing a second btkey can ask the first to

@@ -269,6 +269,182 @@ class UserInstallTest(unittest.TestCase):
             os.path.join(self.home, ".local/bin/btkey")))
 
 
+@unittest.skipIf(not os.path.exists(os.path.join(ROOT, "release")),
+                 "no release script; this is a released tree")
+class ReleaseTest(unittest.TestCase):
+    """Cutting a release.
+
+    The script is left out of the tree it builds, so a checkout of the
+    published branch does not have it and skips this.  It is worth testing
+    where it does exist: it is what decides what everyone else downloads.
+    """
+
+    def setUp(self):
+        self.repo = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
+        shutil.copy(os.path.join(ROOT, "release"),
+                    os.path.join(self.repo, "release"))
+        os.mkdir(os.path.join(self.repo, "btkey"))
+        self.write_version("0.1.0")
+        self.write_changes("0.1.0")
+        self.git("init", "-q", "-b", "devel")
+        self.git("add", "-A")
+        self.commit("first")
+
+    def write_version(self, version):
+        with open(os.path.join(self.repo, "btkey", "__init__.py"), "w") as f:
+            f.write('__version__ = "%s"\n' % version)
+
+    def write_changes(self, *versions):
+        with open(os.path.join(self.repo, "CHANGES.md"), "w") as f:
+            f.write("# Changes\n")
+            for version in versions:
+                f.write("\n## %s\n\n- something about %s\n"
+                        % (version, version))
+
+    def git(self, *args):
+        return subprocess.run(("git",) + args, cwd=self.repo,
+                              capture_output=True, text=True)
+
+    def commit(self, message):
+        self.git("-c", "user.email=t@example.com", "-c", "user.name=T",
+                 "commit", "-qam", message)
+
+    def release(self, *args):
+        return subprocess.run(["./release"] + list(args), cwd=self.repo,
+                              capture_output=True, text=True)
+
+    def published(self):
+        return self.git("log", "--format=%s", "main").stdout.split()
+
+    def test_it_cuts_one_commit(self):
+        self.assertEqual(self.release().returncode, 0)
+        self.assertEqual(self.git("log", "--format=%s", "main").stdout.strip(),
+                         "btkey 0.1.0")
+
+    def test_the_commit_says_what_changed(self):
+        """The message is the whole of what a cut release can say.
+
+        The script puts the tree on the publishing branch as one commit,
+        so a clone of what was cut has that message and the tree; if the
+        message is only the version number, nothing there says what
+        changed.
+        """
+        self.write_changes("0.1.0", "0.0.9")
+        self.commit("changes")
+        self.release()
+        body = self.git("log", "--format=%b", "main").stdout
+        self.assertIn("- something about 0.1.0", body)
+
+    def test_it_says_what_changed_in_this_release_only(self):
+        self.write_changes("0.1.0", "0.0.9")
+        self.commit("changes")
+        self.release()
+        body = self.git("log", "--format=%b", "main").stdout
+        self.assertNotIn("0.0.9", body)
+
+    def test_the_subject_is_still_the_version_alone(self):
+        # The refusal to publish a version twice looks for it by subject.
+        self.release()
+        self.assertEqual(self.git("log", "--format=%s", "main").stdout.strip(),
+                         "btkey 0.1.0")
+
+    def test_it_leaves_itself_out(self):
+        self.release()
+        listing = self.git("ls-tree", "-r", "--name-only", "main").stdout
+        self.assertNotIn("release", listing.split())
+
+    def test_it_comes_back_to_the_branch_it_started_on(self):
+        self.release()
+        self.assertEqual(
+            self.git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip(),
+            "devel")
+
+    def test_the_same_tree_twice_is_not_a_second_commit(self):
+        self.release()
+        result = self.release()
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("nothing to release", result.stdout)
+
+    def test_a_new_tree_under_a_published_version_is_refused(self):
+        """The one that matters.
+
+        Two commits named "btkey 0.1.0" holding different trees is two
+        releases wearing one name, and the one people already have is the
+        one that gets blamed for the difference.
+        """
+        self.release()
+        with open(os.path.join(self.repo, "btkey", "new.py"), "w") as f:
+            f.write("# something since\n")
+        self.git("add", "-A")
+        self.commit("more work")
+        result = self.release()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already has btkey 0.1.0", result.stderr)
+        self.assertIn("bump", result.stderr)
+
+    def test_bumping_the_version_lets_it_through(self):
+        self.release()
+        self.write_version("0.1.1")
+        self.write_changes("0.1.1", "0.1.0")
+        self.commit("bump")
+        self.assertEqual(self.release().returncode, 0)
+        self.assertEqual(self.published(), ["btkey", "0.1.1", "btkey", "0.1.0"])
+
+    def test_a_refusal_leaves_the_branch_where_it_was(self):
+        self.release()
+        self.git("add", "-A")
+        with open(os.path.join(self.repo, "btkey", "new.py"), "w") as f:
+            f.write("# something since\n")
+        self.git("add", "-A")
+        self.commit("more work")
+        self.release()
+        self.assertEqual(
+            self.git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip(),
+            "devel")
+
+    def test_a_version_the_changes_say_nothing_about_is_refused(self):
+        """Cutting the release is when anyone is thinking about this.
+
+        A release nobody can tell apart from the one before it is worth
+        very little, and the file is only kept up if something insists.
+        """
+        self.write_version("0.2.0")
+        self.commit("bump without a word about it")
+        result = self.release()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("0.2.0", result.stderr)
+        self.assertIn("CHANGES.md", result.stderr)
+        self.assertEqual(self.git("rev-parse", "--verify", "-q",
+                                  "main").returncode, 1)
+
+    def test_a_missing_changes_file_is_refused_in_its_own_words(self):
+        os.unlink(os.path.join(self.repo, "CHANGES.md"))
+        self.commit("drop it")
+        result = self.release()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("CHANGES.md", result.stderr)
+        # grep's own complaint about the missing file would be the only
+        # thing on the console otherwise, and it names no version.
+        self.assertNotIn("No such file", result.stderr)
+
+    def test_the_changes_are_looked_at_before_anything_is_cut(self):
+        # --dry-run says what would happen; it should not say a release
+        # would be cut when it would not.
+        self.write_version("0.2.0")
+        self.commit("bump")
+        result = self.release("--dry-run")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("would put the tree", result.stdout)
+
+    def test_a_dirty_tree_is_refused(self):
+        with open(os.path.join(self.repo, "btkey", "__init__.py"), "a") as f:
+            f.write("# uncommitted\n")
+        result = self.release()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("commit them first", result.stderr)
+
+
 @unittest.skipIf(shutil.which("make") is None, "make is not installed")
 class StagedInstallTest(unittest.TestCase):
     """DESTDIR, for building a package rather than installing one."""

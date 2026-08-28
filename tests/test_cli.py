@@ -7,6 +7,7 @@ its vocabulary was the implementation's rather than the user's.  A second
 btkey now carries the message.
 """
 
+import errno
 import io
 import os
 import shutil
@@ -242,6 +243,103 @@ class AudioOptionTest(unittest.TestCase):
             self.assertTrue(cli.switch(word), word)
         for word in config.FALSE_WORDS:
             self.assertFalse(cli.switch(word), word)
+
+
+class ListDevicesTest(unittest.TestCase):
+    """--list-devices, which has to answer "can btkey have it".
+
+    Two questions it used to get wrong: it reported whether a device
+    looked like a keyboard rather than whether btkey could take it, and it
+    decided which devices btkey wants by repeating part of discover()
+    instead of asking it - so a keyboard's media-key interface, which
+    btkey does take, was listed as one it would leave alone.
+    """
+
+    class Device:
+        def __init__(self, path, name="keyboard", error=None):
+            self.path, self.name, self.error = path, name, error
+            self.grab_error, self.grabbed = None, False
+            self.released = []
+
+        def grab(self):
+            self.grab_error = self.error
+            self.grabbed = self.error is None
+            return self.error is None
+
+        def ungrab(self):
+            self.released.append("ungrab")
+            self.grabbed = False
+
+        def close(self):
+            self.released.append("close")
+
+    def setUp(self):
+        self.out = io.StringIO()
+        saved, sys.stdout = sys.stdout, self.out
+        self.addCleanup(setattr, sys, "stdout", saved)
+
+    def listing(self, chosen, others=()):
+        """chosen: what discover() picks.  others: what else is there."""
+        rest = {path: self.Device(path, name) for path, name in others}
+        saved_discover = cli.evdev.discover
+        saved_device = cli.evdev.InputDevice
+        saved_glob = cli.glob.glob
+        cli.evdev.discover = lambda extra=(): list(chosen)
+        cli.evdev.InputDevice = lambda path: rest[path]
+        cli.glob.glob = lambda pattern: sorted(
+            [d.path for d in chosen] + list(rest))
+        self.addCleanup(setattr, cli.evdev, "discover", saved_discover)
+        self.addCleanup(setattr, cli.evdev, "InputDevice", saved_device)
+        self.addCleanup(setattr, cli.glob, "glob", saved_glob)
+        cli.list_devices([])
+        return self.out.getvalue()
+
+    def test_a_device_btkey_wants_and_can_have(self):
+        said = self.listing([self.Device("/dev/input/event0")])
+        self.assertIn("grab", said)
+
+    def test_a_device_btkey_wants_and_cannot_have(self):
+        said = self.listing([self.Device("/dev/input/event0",
+                                         error=errno.EBUSY)])
+        self.assertIn("held", said)
+        self.assertNotIn("grab", said)
+
+    def test_a_device_btkey_does_not_want(self):
+        said = self.listing([], others=[("/dev/input/event0", "Power Button")])
+        self.assertIn("-", said)
+        self.assertNotIn("grab", said)
+        self.assertNotIn("held", said)
+
+    def test_whatever_discover_picks_is_what_is_listed(self):
+        """Including a companion, which the listing cannot work out itself.
+
+        A keyboard's media-key interface does not look like a keyboard;
+        only discover() knows it belongs to one that is.
+        """
+        media = self.Device("/dev/input/event6", "USB keyboard media keys")
+        said = self.listing([media], others=[("/dev/input/event0", "Power")])
+        self.assertIn("grab   USB keyboard media keys", said)
+
+    def test_another_failure_is_named_for_what_it_was(self):
+        said = self.listing([self.Device("/dev/input/event0",
+                                         error=errno.ENODEV)])
+        self.assertIn("No such device", said)
+
+    def test_a_device_it_took_is_given_straight_back(self):
+        # Holding it would take the keyboard from the console for as long
+        # as the listing ran.
+        device = self.Device("/dev/input/event0")
+        self.listing([device])
+        self.assertEqual(device.released, ["ungrab", "close"])
+        self.assertFalse(device.grabbed)
+
+    def test_they_are_listed_in_number_order(self):
+        # Sorting by name puts event10 between event1 and event2.
+        said = self.listing([self.Device("/dev/input/event%d" % n)
+                             for n in (1, 2, 10)])
+        order = [line.split()[0] for line in said.strip().splitlines()]
+        self.assertEqual(order, ["/dev/input/event1", "/dev/input/event2",
+                                 "/dev/input/event10"])
 
 
 class CommandDispatchTest(unittest.TestCase):

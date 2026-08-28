@@ -54,6 +54,10 @@ class FakeDevice:
         self.queue = []
         self.saved_leds = None
         self.closed = False
+        # Held, unless a test says otherwise: btkey does not forward from
+        # a keyboard it could not take.
+        self.grabbed = True
+        self.refused = False
 
     def read_keys(self):
         if self.queue is None:
@@ -71,7 +75,7 @@ class FakeDevice:
 class FakeKeyboards:
     """Stands in for the set of grabbed evdev keyboards."""
 
-    def __init__(self, extra_paths=(), on_event=None):
+    def __init__(self, extra_paths=(), on_event=None, on_debug=None):
         self.devices = {}
         self.held = set()          # what is physically down right now
         self.leds = None

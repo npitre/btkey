@@ -34,7 +34,7 @@ import sys
 import time
 
 import dbus
-from gi.repository import GLib
+from gi.repository import Gio, GLib
 
 from . import (advertising, btd, btlink, display, evdev, fifo, journal,
                kbmap, keycodes, pairing, probe, typist, __version__)
@@ -49,6 +49,16 @@ FOREGROUND_POLL_MS = 40
 # How long to let the keyboard connection settle before asking the phone
 # for its audio channel too.  Asking in the same breath comes back busy.
 AUDIO_CONNECT_DELAY = 3
+
+# A keyboard arriving shows up as a node in /dev/input, which we are told
+# about rather than going to look.  The node appears before udev has given
+# it its ownership and mode, though, so a look the instant it is created
+# finds something we are not allowed to open yet: wait out a short quiet
+# spell first, which also folds the burst a single keyboard arrives as
+# (several nodes, each created and then chmodded) into one look.
+DEVICE_SETTLE_MS = 250
+
+# Only for when the kernel will not let us watch the directory at all.
 DEVICE_RESCAN_MS = 2000
 
 # How often to recompute how far a sweep has got.  The display only
@@ -82,8 +92,11 @@ class Session:
         self.consoles = consoles
         self.guardian = keeper
         self.btd = None
-        self.keyboards = evdev.KeyboardSet(options.device, on_event=self.log)
+        self.keyboards = evdev.KeyboardSet(options.device, on_event=self.log,
+                                           on_debug=self.note)
         self.watches = {}
+        self.device_monitor = None
+        self.device_settle = None
         self.control_fd = None
         self.sweep_name = None      # not None while a sweep is being typed
         self.sweep_queued = 0
@@ -133,6 +146,11 @@ class Session:
             self.link, options, self.log, self.announce, self.journal.record)
 
     # -- output ----------------------------------------------------------
+
+    def note(self, message):
+        """Detail that is only wanted when something is being chased."""
+        if self.options.debug:
+            self.log(message)
 
     def log(self, message):
         """Routine progress.  Scrolls past; nothing has to read it."""
@@ -266,6 +284,7 @@ class Session:
             return False
         # Read even when backgrounded, or the descriptor stays readable and
         # spins the loop; just do not act on any of it.
+        #
         if not self.foreground:
             return True
         for keycode, is_press in events:
@@ -539,6 +558,44 @@ class Session:
                 pass
         self.keyboards.forget(device)
 
+    def watch_for_devices(self):
+        """Ask to be told when a keyboard is plugged in or pulled out.
+
+        A keyboard arrives or leaves perhaps once in a session, and
+        finding out by looking costs a directory listing and a fresh
+        look at every node in it, every time.
+        """
+        try:
+            directory = Gio.File.new_for_path(evdev.DEVICE_DIRECTORY)
+            self.device_monitor = directory.monitor_directory(
+                Gio.FileMonitorFlags.NONE, None)
+        except GLib.Error as exc:
+            self.log("cannot watch %s (%s); looking every %d ms instead"
+                     % (evdev.DEVICE_DIRECTORY, exc.message,
+                        DEVICE_RESCAN_MS))
+            GLib.timeout_add(DEVICE_RESCAN_MS, self.rescan_devices)
+            return
+        self.device_monitor.connect("changed", self.device_directory_changed)
+
+    def device_directory_changed(self, monitor, node, other, event):
+        if event not in (Gio.FileMonitorEvent.CREATED,
+                         Gio.FileMonitorEvent.DELETED,
+                         Gio.FileMonitorEvent.ATTRIBUTE_CHANGED):
+            return
+        if self.device_settle is not None:
+            GLib.source_remove(self.device_settle)
+        self.device_settle = GLib.timeout_add(DEVICE_SETTLE_MS,
+                                              self.settle_devices)
+
+    def settle_devices(self):
+        self.device_settle = None
+        self.rescan_devices()
+        if self.foreground:
+            # It arrived while we have the screen, so it is ours to take;
+            # otherwise the switch back does this.
+            self.keyboards.grab_all()
+        return False
+
     def rescan_devices(self):
         added, removed = self.keyboards.refresh()
         for device in removed:
@@ -557,6 +614,10 @@ class Session:
             return
         self.foreground = foreground
         if foreground:
+            # What is plugged in can change while another console has
+            # the screen, and a keyboard that arrived then was left alone
+            # rather than taken away from whoever was using it.
+            self.rescan_devices()
             self.keyboards.grab_all()
             self.sync_modifiers()
             self.push_leds()
@@ -685,7 +746,7 @@ class Session:
 
             self.poll_foreground()
             GLib.timeout_add(FOREGROUND_POLL_MS, self.poll_foreground)
-            GLib.timeout_add(DEVICE_RESCAN_MS, self.rescan_devices)
+            self.watch_for_devices()
             if self.guardian is not None:
                 GLib.timeout_add(HEARTBEAT_MS, self.heartbeat)
                 self.guardian.watch_me(WATCHDOG_SECONDS)

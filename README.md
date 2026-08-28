@@ -191,7 +191,8 @@ elsewhere, and `--no-log-file` turns it off.
 
 It is on from a checkout and off from an installation, and mode 0600 where
 it exists, a pairing passkey being among the things it records.  `--debug`
-adds the Bluetooth agent calls and HID control traffic.
+adds the Bluetooth agent calls, the HID control traffic, and the keyboards
+another program is holding.
 
 If what the machine advertises has changed since the last run btkey says
 so, because a phone already paired will not see the change until it is
