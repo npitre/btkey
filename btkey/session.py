@@ -19,6 +19,11 @@ because it has state of its own worth keeping separate:
   pairing      the passkey state machine
   typist       pasted text, which arrives as characters rather than keys
   advertising  the class of device, and noticing when it moves
+  sweep        typing a probe at the phone, over the minute it takes
+
+It owns the display, the link, the keyboards, the consoles, the private
+bluetoothd and the guardian as well, but those are things it drives
+rather than work it handed over.
 
 Only two things stayed here that might look like they belong elsewhere.
 Lock state is inferred from keys on their way out, because iOS never
@@ -31,47 +36,56 @@ import os
 import pwd
 import signal
 import sys
-import time
 
-import dbus
 from gi.repository import Gio, GLib
 
 from . import (advertising, btd, btlink, display, evdev, fifo, journal,
-               kbmap, keycodes, pairing, probe, typist, __version__)
-from .typist import INTERVAL_MS as TYPE_INTERVAL_MS
+               keycodes, pairing, sweep, typist, vt, __version__)
 
-# How often to check whether our console is still in front.  We notice our
-# own switches immediately; this is only for a chvt from somewhere else, and
-# for coming back.  Cheap enough to run often, and a slow poll would leak
-# the first keystrokes after a switch back into the local shell.
+# Only for a kernel without the sysfs attribute the console change is
+# waited on: btkey notices its own switches without being told, but not a
+# chvt from somewhere else, and until it does it still holds the keyboard
+# the other console is being typed at.  Hence a brisk fallback.
 FOREGROUND_POLL_MS = 40
 
 # How long to let the keyboard connection settle before asking the phone
-# for its audio channel too.  Asking in the same breath comes back busy.
-AUDIO_CONNECT_DELAY = 3
+# for its audio channel too.  Asking in the same breath comes back busy,
+# which is the only reason to wait at all - so ask soon and ask again,
+# rather than guessing at a delay long enough to have been safe.  Doubling
+# from one second, four times over, is attempts at 1, 3, 7 and 15 seconds.
+AUDIO_CONNECT_DELAY = 1
+AUDIO_RETRIES = 4
 
 # A keyboard arriving shows up as a node in /dev/input, which we are told
-# about rather than going to look.  The node appears before udev has given
-# it its ownership and mode, though, so a look the instant it is created
-# finds something we are not allowed to open yet: wait out a short quiet
-# spell first, which also folds the burst a single keyboard arrives as
-# (several nodes, each created and then chmodded) into one look.
-DEVICE_SETTLE_MS = 250
+# about rather than going to look.  Wait for the arrivals to stop before
+# looking, restarting the wait at every one, for three reasons in
+# ascending order of how long they take.
+#
+# The node appears before udev has given it its ownership and mode, so a
+# look the instant it is created finds something we are not allowed to
+# open.  One keyboard is a burst of several nodes, each created and then
+# chmodded, and is worth one look rather than six.
+#
+# And whatever else on the machine wants this keyboard should have it
+# first.  A program that takes it for its own hotkeys is not competing
+# with btkey - it publishes what it does not want through uinput, and
+# that loopback is the device btkey should be holding.  BRLTTY does
+# exactly this.  Looking too soon means grabbing the real keyboard out
+# from under it, or finding the loopback has not been created yet and
+# missing it until the next switch.  A second is nothing against a
+# keyboard being plugged in, and it is the loopback appearing that ends
+# the wait in any case.
+DEVICE_SETTLE_MS = 1000
 
 # Only for when the kernel will not let us watch the directory at all.
 DEVICE_RESCAN_MS = 2000
-
-# How often to recompute how far a sweep has got.  The display only
-# repaints when the number actually changes, so a brisk poll costs nothing:
-# a minute of typing moves the percentage about sixty times either way.
-SWEEP_PROGRESS_MS = 500
 
 # The guardian kills us if the main loop stops running for this long, which
 # releases the keyboard grabs.  Generous enough that a stalled outbound
 # Bluetooth connect - the only thing here that blocks for seconds - cannot
 # trip it.
-HEARTBEAT_MS = 2000
-WATCHDOG_SECONDS = 15
+HEARTBEAT_MS = 5000
+WATCHDOG_SECONDS = 10
 
 # Rollover: the boot report can name six keys, and the convention when more
 # are down is to fill every slot with ErrorRollOver.
@@ -97,12 +111,9 @@ class Session:
         self.watches = {}
         self.device_monitor = None
         self.device_settle = None
+        self.device_timer = None    # the fallback, where there is no watch
+        self.heartbeat_timer = None
         self.control_fd = None
-        self.sweep_name = None      # not None while a sweep is being typed
-        self.sweep_queued = 0
-        self.sweep_started = None
-        self.sweep_reports = 0
-        self.sweep_waiting = 0.0
 
         self.display = display.Display()
         self.journal = journal.Journal(options.log_file,
@@ -144,6 +155,8 @@ class Session:
                                     layout_path=options.phone_layout)
         self.advertising = advertising.Advertising(
             self.link, options, self.log, self.announce, self.journal.record)
+        self.sweep = sweep.Sweep(self.typist, self.link, self.display,
+                                 self.log, self.announce)
 
     # -- output ----------------------------------------------------------
 
@@ -211,10 +224,24 @@ class Session:
                      % (vendor, " (Apple)" if apple else "",
                         "media keys" if apple else "F1 to F12"))
 
-    def offer_audio(self, peer):
-        """Ask the phone to open its audio channel, once, per connection."""
-        if self.link.connected and peer == self.link.peer:
-            self.log(self.link.connect_audio(peer))
+    def offer_audio(self, peer, wait=AUDIO_CONNECT_DELAY,
+                    left=AUDIO_RETRIES):
+        """Ask the phone to open its audio channel, per connection.
+
+        Being told the phone is busy is not an answer, it is a request to
+        come back; the single attempt this used to make left the machine
+        advertising somewhere to send sound with nothing ever asking for
+        it, and nothing saying why.
+        """
+        if not (self.link.connected and peer == self.link.peer):
+            return False
+        message, again = self.link.connect_audio(peer)
+        if again and left:
+            self.note("%s; asking again in %ds" % (message, wait * 2))
+            GLib.timeout_add_seconds(wait * 2, self.offer_audio, peer,
+                                     wait * 2, left - 1)
+            return False
+        self.log(message)
         return False
 
     def on_passkey_request(self, peer, legacy):
@@ -282,9 +309,9 @@ class Session:
             self.log("%s went away" % device.name)
             self.drop_device(device)
             return False
-        # Read even when backgrounded, or the descriptor stays readable and
-        # spins the loop; just do not act on any of it.
-        #
+        # The descriptors are given up on the way out, so ordinarily
+        # nothing arrives from the background at all.  This is for the
+        # event GLib had already queued when the console changed.
         if not self.foreground:
             return True
         for keycode, is_press in events:
@@ -389,18 +416,21 @@ class Session:
         """Commands, as opposed to text to type."""
         try:
             data = os.read(fd, 4096)
-        except OSError:
+        except OSError as exc:
+            if not fifo.keep_watching(exc):
+                self.log("control channel failed: %s" % exc.strerror)
+                return False
             return True
         if not data:
             return False
         for line in data.decode("utf-8", "replace").split("\n"):
             command = line.strip()
             if command == "learn-layout":
-                self.learn_layout()
+                self.sweep.learn_layout()
             elif command.startswith("learn-accents"):
-                self.learn_accents(command.split()[1:])
+                self.sweep.learn_accents(command.split()[1:])
             elif command == "cancel":
-                self.cancel_learning()
+                self.sweep.cancel()
             elif command == "quit":
                 self.quit("asked to")
             elif command:
@@ -415,148 +445,61 @@ class Session:
                               GLib.IOCondition.IN, self.on_control)
         self.log("listening for commands on %s" % path)
 
-    def type_batch(self, name, steps):
-        """Type a labelled probe sequence, reporting how far it has got.
-
-        A sweep takes a minute, during which the instruction is not to
-        touch the keyboard - so it has to say when it is finished, or there
-        is nothing to do but guess.  The bell is the part that matters:
-        BRLTTY monitors it, so the end arrives without having to watch for
-        it.  The running percentage is for reassurance in between.
-        """
-        # Every keystroke here is a position, never text.  Going through
-        # the console keymap would put the one mapping this exists to
-        # measure in the middle of measuring it, and garble the capture on
-        # any machine whose console does not match the phone.
-        self.typist.enqueue(steps)
-
-        self.sweep_name = name
-        self.sweep_queued = len(self.typist.queue)
-        self.sweep_started = time.monotonic()
-        self.sweep_reports = self.link.sent_reports
-        self.sweep_waiting = self.link.send_seconds
-        self.announce("%s: about %d seconds; do not type until the bell"
-                      % (name,
-                         max(1, len(self.typist.queue) * TYPE_INTERVAL_MS
-                             // 1000)))
-        GLib.timeout_add(SWEEP_PROGRESS_MS, self.poll_sweep)
-
-    def poll_sweep(self):
-        if self.sweep_name is None:
-            return False
-        if not self.link.connected:
-            # drain() empties the queue on a disconnect, which would
-            # otherwise read as completion - bell and all - and send
-            # someone off to mail a capture that stops halfway.
-            self.typist.clear()
-            self.finish_sweep("%s stopped: the phone disconnected"
-                              % self.sweep_name)
-            return False
-        remaining = len(self.typist.queue)
-        if remaining:
-            done = self.sweep_queued - remaining
-            self.display.set_indicator(
-                "%d%%" % (100 * done // max(self.sweep_queued, 1)))
-            return True
-        self.finish_sweep("%s: done. The text is on the phone; send it to "
-                          "yourself." % self.sweep_name)
-        return False
-
-    def cancel_learning(self):
-        if self.sweep_name is None:
-            # Nothing to cancel is not the same as cancel everything: a
-            # paste may well be draining.
-            self.log("nothing to cancel")
-            return
-        dropped = self.typist.clear()
-        self.finish_sweep("%s cancelled, %d keystrokes dropped"
-                          % (self.sweep_name, dropped))
-
-    def finish_sweep(self, message):
-        self.log(self.sweep_timing())
-        self.sweep_name = None
-        self.sweep_queued = 0
-        self.sweep_started = None
-        # Put the lock indicator back; the percentage was borrowing its slot.
-        self.display.set_indicator(btlink.led_indicator(self.leds))
-        self.display.bell()
-        self.announce(message)
-
-    def sweep_timing(self):
-        """How long the probe took, and how much of it was the radio.
-
-        A probe that runs slower than the estimate has two possible
-        reasons and they call for different things.  If the time went into
-        send(), the link is the limit: the socket blocks, so a phone that
-        cannot absorb reports as fast as btkey produces them stops the main
-        loop for as long as it takes, and sharing the link with A2DP audio
-        is enough to do it.  If it did not, the limit is here.
-        """
-        if self.sweep_started is None:
-            return "sweep finished"
-        elapsed = time.monotonic() - self.sweep_started
-        reports = self.link.sent_reports - self.sweep_reports
-        waiting = self.link.send_seconds - self.sweep_waiting
-        estimate = self.sweep_queued * TYPE_INTERVAL_MS / 1000.0
-        return ("%d reports in %.1fs (estimated %.1fs); %.1fs of that "
-                "waiting on the link" % (reports, elapsed, estimate, waiting))
-
-    def learn_accents(self, specs):
-        """Type the second probe: every candidate accent key, composed.
-
-        A single-keystroke probe cannot see a composition, because a dead
-        key followed by the space it types looks exactly like a literal
-        accent.  So a second pass is unavoidable - and which keys it should
-        try is decided by the *first* pass's results, which live on the
-        phone.  The client works that out from the capture and sends the
-        list, which is why this takes one rather than reading a file.
-        """
-        if not self.link.connected:
-            self.log("not connected; nothing to learn from")
-            return
-        candidates = []
-        for spec in specs:
-            keycode, _, mods = spec.partition(":")
-            try:
-                keycode, mods = int(keycode), int(mods or 0)
-            except ValueError:
-                self.log("ignoring malformed accent key %r" % spec)
-                continue
-            # Straight off the control FIFO and into a HID report.
-            if not 0 <= keycode <= 0xFFFF or not 0 <= mods <= 0xFF:
-                self.log("ignoring out-of-range accent key %r" % spec)
-                continue
-            candidates.append((keycode, mods, ""))
-        if not candidates:
-            self.log("no accent keys given; run btkey --learn-accents "
-                     "with the capture from --learn-layout")
-            return
-        self.type_batch("learning accent keys",
-                        probe.compose_strokes(candidates))
-
-    def learn_layout(self):
-        """Type the first probe: every key position, at every level."""
-        if not self.link.connected:
-            self.log("not connected; nothing to learn from")
-            return
-        self.type_batch("learning the keyboard layout",
-                        probe.capture_strokes())
-
     # -- devices -----------------------------------------------------------
 
     def watch_device(self, device):
+        if device.path in self.watches:
+            return
         self.watches[device.path] = GLib.unix_fd_add_full(
             GLib.PRIORITY_DEFAULT, device.fd,
             GLib.IOCondition.IN, self.on_device_input, device)
 
-    def drop_device(self, device):
+    def unwatch_device(self, device):
+        """Stop waking for this one.  Always before closing its fd."""
         source = self.watches.pop(device.path, None)
         if source is not None:
             try:
                 GLib.source_remove(source)
             except (ValueError, GLib.Error):
                 pass
+
+    def drop_device(self, device):
+        self.unwatch_device(device)
         self.keyboards.forget(device)
+
+    def sleep_devices(self):
+        """Let the keyboards go while another console has them.
+
+        Ungrabbing is not enough.  An open device still delivers
+        everything typed on it, so btkey wakes for every keystroke meant
+        for somebody else, only to throw it away.
+        """
+        for device in self.keyboards.devices.values():
+            self.unwatch_device(device)
+        self.keyboards.close_all()
+
+    def wake_devices(self):
+        """Take them back, and drop the ones that are no longer there."""
+        for device in self.keyboards.open_all():
+            self.log("%s went away" % device.name)
+            self.drop_device(device)
+        for device in self.keyboards.devices.values():
+            self.watch_device(device)
+
+    def hold_only_what_we_grabbed(self):
+        """Give back the descriptors of the keyboards that would not come.
+
+        A device we hold no grab on is either somebody else's, and then
+        it delivers us nothing at all, or nobody's, and then its keys
+        reach the console as well and come back to us as text; either
+        way holding it open buys nothing.  It is opened and tried again
+        on the next switch back, so a keyboard that comes free is not
+        lost by this.
+        """
+        for device in self.keyboards.devices.values():
+            if not device.grabbed:
+                self.unwatch_device(device)
+                device.close()
 
     def watch_for_devices(self):
         """Ask to be told when a keyboard is plugged in or pulled out.
@@ -564,7 +507,13 @@ class Session:
         A keyboard arrives or leaves perhaps once in a session, and
         finding out by looking costs a directory listing and a fresh
         look at every node in it, every time.
+
+        Only while our console is in front.  What is plugged in while
+        another console has the screen is that console's business, and we
+        look afresh on the way back in any case.
         """
+        if self.device_monitor is not None or self.device_timer is not None:
+            return
         try:
             directory = Gio.File.new_for_path(evdev.DEVICE_DIRECTORY)
             self.device_monitor = directory.monitor_directory(
@@ -573,11 +522,27 @@ class Session:
             self.log("cannot watch %s (%s); looking every %d ms instead"
                      % (evdev.DEVICE_DIRECTORY, exc.message,
                         DEVICE_RESCAN_MS))
-            GLib.timeout_add(DEVICE_RESCAN_MS, self.rescan_devices)
+            self.device_timer = GLib.timeout_add(DEVICE_RESCAN_MS,
+                                                 self.rescan_devices)
             return
         self.device_monitor.connect("changed", self.device_directory_changed)
 
+    def unwatch_for_devices(self):
+        """Stop being told, and forget any change still settling."""
+        if self.device_monitor is not None:
+            self.device_monitor.cancel()
+            self.device_monitor = None
+        if self.device_timer is not None:
+            GLib.source_remove(self.device_timer)
+            self.device_timer = None
+        if self.device_settle is not None:
+            GLib.source_remove(self.device_settle)
+            self.device_settle = None
+
     def device_directory_changed(self, monitor, node, other, event):
+        if self.device_monitor is None:
+            # Cancelled while this one was already on its way to us.
+            return
         if event not in (Gio.FileMonitorEvent.CREATED,
                          Gio.FileMonitorEvent.DELETED,
                          Gio.FileMonitorEvent.ATTRIBUTE_CHANGED):
@@ -602,7 +567,8 @@ class Session:
             self.drop_device(device)
         for device in added:
             self.log("keyboard appeared: %s" % device.name)
-            self.watch_device(device)
+            if not self.keyboards.asleep:
+                self.watch_device(device)
         if added and self.foreground:
             self.push_leds()
         return True
@@ -614,17 +580,30 @@ class Session:
             return
         self.foreground = foreground
         if foreground:
-            # What is plugged in can change while another console has
-            # the screen, and a keyboard that arrived then was left alone
-            # rather than taken away from whoever was using it.
+            # The watch goes on before the look, never after.  A keyboard
+            # plugged in between the two would otherwise fall through the
+            # gap: too late for the scan, too early for a watch that did
+            # not exist yet, and unnoticed until the next switch.
+            self.watch_for_devices()
+            self.wake_devices()
             self.rescan_devices()
             self.keyboards.grab_all()
+            self.hold_only_what_we_grabbed()
             self.sync_modifiers()
             self.push_leds()
+            self.watch_myself()
         else:
-            # Release before letting go, or the phone keeps holding Alt.
+            # And comes off before the keyboards go, for the same reason
+            # the other way round: an arrival reported after we have let
+            # go would have us open and grab a device on a console that
+            # is no longer ours.
+            self.unwatch_for_devices()
+            # Release before letting go, or the phone keeps holding Alt,
+            # and hand the LEDs back before the descriptors go.
             self.release_all()
             self.keyboards.ungrab_all()
+            self.sleep_devices()
+            self.unwatch_myself()
 
     def sync_modifiers(self):
         """Adopt the modifiers that are physically held, on taking the grab.
@@ -639,6 +618,45 @@ class Session:
         for keycode in self.keyboards.held_keys():
             modifiers |= keycodes.MODIFIERS.get(keycode, 0)
         self.modifiers = modifiers
+
+    def watch_foreground(self):
+        """Ask to be told when the console in front changes.
+
+        Asking instead costs a wakeup and an ioctl 25 times a second for
+        as long as btkey runs, whatever is or is not happening.
+        """
+        fd = self.consoles.watch()
+        if fd is None:
+            self.ask_for_the_console("cannot watch %s" % vt.ACTIVE_ATTRIBUTE)
+            return
+        GLib.unix_fd_add_full(
+            GLib.PRIORITY_DEFAULT, fd,
+            GLib.IOCondition.PRI | GLib.IOCondition.ERR,
+            self.console_changed)
+
+    def console_changed(self, fd, condition):
+        if condition & GLib.IOCondition.PRI and self.consoles.rearm():
+            return self.poll_foreground()
+
+        # A descriptor in error is reported ready for ever, so saying
+        # "carry on" here would spin the loop on it for the rest of the
+        # run.  BRLTTY had to fix exactly this in its own monitor, twice:
+        # once for the error arriving instead of the event, and once for
+        # a callback that kept the monitor alive through it.  Note that
+        # the ordinary notification is POLLPRI and POLLERR together, so
+        # only an error without the event counts as one.
+        self.ask_for_the_console("the console watch failed")
+        self.poll_foreground()
+        return False
+
+    def ask_for_the_console(self, why):
+        """Fall back to asking which console is in front.
+
+        Both ways of losing the watch end here, so the interval and the
+        wording are settled in one place.
+        """
+        self.log("%s; asking every %d ms instead" % (why, FOREGROUND_POLL_MS))
+        GLib.timeout_add(FOREGROUND_POLL_MS, self.poll_foreground)
 
     def poll_foreground(self):
         self.set_foreground(self.consoles.is_foreground())
@@ -656,6 +674,27 @@ class Session:
     def heartbeat(self):
         self.guardian.heartbeat()
         return True
+
+    def watch_myself(self):
+        """Ask the guardian to kill us if the loop stops turning.
+
+        Only while our console is in front, because that is the only time
+        we hold anybody's keyboard.  Backgrounded, a wedged btkey is a
+        process that does nothing rather than a machine that cannot be
+        typed at, and there is nothing for a SIGKILL to release.
+        """
+        if self.guardian is None or self.heartbeat_timer is not None:
+            return
+        self.guardian.watch_me(WATCHDOG_SECONDS)
+        self.heartbeat()
+        self.heartbeat_timer = GLib.timeout_add(HEARTBEAT_MS, self.heartbeat)
+
+    def unwatch_myself(self):
+        if self.guardian is None or self.heartbeat_timer is None:
+            return
+        GLib.source_remove(self.heartbeat_timer)
+        self.heartbeat_timer = None
+        self.guardian.watch_me(0)      # stand down until we are back
 
     def quit(self, reason=""):
         if self.quit_requested:
@@ -744,17 +783,16 @@ class Session:
             if self.options.control_fifo:
                 self.open_control_fifo(self.options.control_fifo)
 
+            # These follow the foreground: poll_foreground puts them in
+            # place if our console is already in front, which at startup
+            # it is, since btkey was just typed at it.
             self.poll_foreground()
-            GLib.timeout_add(FOREGROUND_POLL_MS, self.poll_foreground)
-            self.watch_for_devices()
-            if self.guardian is not None:
-                GLib.timeout_add(HEARTBEAT_MS, self.heartbeat)
-                self.guardian.watch_me(WATCHDOG_SECONDS)
+            self.watch_foreground()
             self.install_signals()
             self.loop.run()
-        except (btlink.ProfileNotAvailable, btd.BluetoothdError,
-                dbus.DBusException) as exc:
-            self.startup_error = describe(exc)
+        except (btlink.ProfileNotAvailable, btlink.LinkError,
+                btd.BluetoothdError) as exc:
+            self.startup_error = str(exc)
             self.exit_code = 1
         finally:
             # Disarm the watchdog first: heartbeats stopped when the loop
@@ -797,8 +835,4 @@ def started_by():
         return "uid %d" % uid
 
 
-def describe(exc):
-    if isinstance(exc, dbus.DBusException):
-        return "%s: %s" % (exc.get_dbus_name(),
-                           exc.get_dbus_message() or "no detail given")
-    return str(exc) or exc.__class__.__name__
+

@@ -13,6 +13,11 @@ both calls in place.  Starting the private bluetoothd raised AttributeError
 from then on, and since that is not a BluetoothdError it went past the
 handler that would have explained it.
 
+It happened again, differently: a function was moved into btlink and the
+call to it went in, but the definition was lost to a botched edit.  Every
+test passed, because nothing but the real startup path calls it.  So the
+same question is asked across modules as well as within them.
+
 A type checker would say all this and more.  This is the part that can be
 had for a page of ast, run by the same command as everything else.
 """
@@ -28,8 +33,11 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The tools are Python and call into the package, so they are exposed to
+# the same mistake this file exists to catch; only the bash one is not.
 SOURCES = (sorted(glob.glob(os.path.join(ROOT, "btkey", "*.py")))
-           + [os.path.join(ROOT, "bin", "btkey")])
+           + [os.path.join(ROOT, "bin", "btkey"),
+              os.path.join(ROOT, "tools", "btkey-trace-input")])
 
 
 def parse(path):
@@ -124,6 +132,62 @@ class ModuleTest(unittest.TestCase):
                         node.id, names,
                         "%s:%d uses %s, which is bound nowhere in the file"
                         % (os.path.relpath(path, ROOT), node.lineno, node.id))
+
+
+
+class SiblingAttributeTest(unittest.TestCase):
+    """Every btkey.thing.name the code mentions, against what is there.
+
+    The within-a-file check above cannot see this: `btlink` is bound in
+    cli.py by the import, so `btlink.use_glib_mainloop()` looks fine
+    there whatever btlink actually holds.  Only the module itself can
+    answer, and importing btkey is cheap - the tests do it anyway.
+    """
+
+    PACKAGE = "btkey"
+
+    def modules(self):
+        """The package's own modules, by the name others import them as."""
+        import importlib
+        found = {}
+        for path in SOURCES:
+            name = os.path.basename(path)
+            if not name.endswith(".py") or name == "__init__.py":
+                continue
+            stem = name[:-3]
+            found[stem] = importlib.import_module("%s.%s"
+                                                  % (self.PACKAGE, stem))
+        return found
+
+    def test_every_sibling_attribute_exists(self):
+        known = self.modules()
+        for path in SOURCES:
+            tree = parse(path)
+            # Only the names this file actually imports from the package;
+            # a local variable called `probe` is not the module.
+            imported = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.level:
+                    imported |= {alias.asname or alias.name
+                                 for alias in node.names}
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if alias.name.startswith(self.PACKAGE + "."):
+                            imported.add(alias.asname
+                                         or alias.name.split(".")[-1])
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Attribute):
+                    continue
+                if not isinstance(node.value, ast.Name):
+                    continue
+                module = known.get(node.value.id)
+                if module is None or node.value.id not in imported:
+                    continue
+                self.assertTrue(
+                    hasattr(module, node.attr),
+                    "%s:%d uses %s.%s, which %s does not have"
+                    % (os.path.relpath(path, ROOT), node.lineno,
+                       node.value.id, node.attr, node.value.id))
 
 
 if __name__ == "__main__":

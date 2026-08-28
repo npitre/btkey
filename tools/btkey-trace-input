@@ -30,13 +30,13 @@ sys.path.insert(0, LIBDIR or os.path.dirname(
 
 from btkey import evdev, keycodes
 
-NAMES = {
-    1: "Escape", 14: "Backspace", 15: "Tab", 28: "Enter", 57: "Space",
-    58: "CapsLock", 96: "KpEnter", 102: "Home", 103: "Up", 104: "PageUp",
-    105: "Left", 106: "Right", 107: "End", 108: "Down", 109: "PageDown",
-    110: "Insert", 111: "Delete", 119: "Pause",
-    # The keys a keyboard puts behind Fn, which is what anyone hunting for
-    # its media functions is pressing.
+# The keys btkey never has to name, because it forwards them by position
+# and says nothing about them.  Naming them is what this tool is for: they
+# are what a keyboard puts behind Fn, which is what anyone hunting for its
+# media functions is pressing.  Everything else comes from keycodes.NAMES,
+# so the two cannot end up calling one key by two names.
+EXTRA_NAMES = {
+    96: "KpEnter",
     113: "Mute", 114: "VolumeDown", 115: "VolumeUp", 116: "Power",
     128: "Stop", 140: "Calculator", 142: "Sleep", 143: "WakeUp",
     150: "WWW", 155: "Mail", 158: "Back", 159: "Forward",
@@ -47,16 +47,9 @@ NAMES = {
     226: "Media", 227: "SwitchVideoMode", 228: "KbdIllumToggle",
 }
 
-FUNCTION_KEYS = {59: "F1", 60: "F2", 61: "F3", 62: "F4", 63: "F5", 64: "F6",
-                 65: "F7", 66: "F8", 67: "F9", 68: "F10", 87: "F11",
-                 88: "F12"}
-NAMES.update(FUNCTION_KEYS)
-
 
 def key_name(keycode):
-    if keycode in NAMES:
-        return NAMES[keycode]
-    return "keycode %d" % keycode
+    return EXTRA_NAMES.get(keycode) or keycodes.key_name(keycode)
 
 
 def forwarding(keycode):

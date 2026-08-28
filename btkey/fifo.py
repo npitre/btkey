@@ -21,8 +21,25 @@ channel that had logged itself as working.  So anything in the way that is
 not a FIFO gets replaced.
 """
 
+import errno
 import os
 import stat
+
+
+# The errnos that mean "nothing to read just now" rather than "this
+# descriptor is finished with".
+TRANSIENT = (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR)
+
+
+def keep_watching(exc):
+    """Whether a failed read leaves the watch worth keeping.
+
+    A descriptor in error is reported ready for ever, so a GLib callback
+    that swallows the error and says "carry on" spins the main loop for
+    the rest of the run and starves everything else, keystrokes included.
+    Only the transient errnos are worth carrying on for.
+    """
+    return exc.errno in TRANSIENT
 
 
 def invoking_user():

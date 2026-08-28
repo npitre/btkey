@@ -25,10 +25,11 @@ import struct
 import time
 
 import dbus
+import dbus.mainloop.glib
 import dbus.service
 from gi.repository import GLib
 
-from . import hidspec
+from . import fifo, hidspec
 
 BLUEZ = "org.bluez"
 ADAPTER_IFACE = "org.bluez.Adapter1"
@@ -78,6 +79,39 @@ PROTOCOL_REPORT = 1
 
 class ProfileNotAvailable(Exception):
     """The HID UUID or its PSMs are already taken by bluetoothd."""
+
+
+class LinkError(Exception):
+    """Something BlueZ would not do.
+
+    D-Bus is this module's business and nobody else's, so a
+    DBusException is converted here rather than carried out to a caller
+    that would have to know what one is to report it.
+    """
+
+
+def use_glib_mainloop():
+    """Marry D-Bus to the GLib loop, which has to happen before the bus.
+
+    dbus-python dispatches through whatever main loop was made the
+    default when the connection was opened, so this has to be done
+    before the first SystemBus anywhere in the program - which is btd's,
+    not this module's.  It lives here because that ordering rule is
+    D-Bus knowledge, and D-Bus is this module's business.
+    """
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+
+
+def describe(exc):
+    """A D-Bus failure as a line someone can act on.
+
+    The name alone ("org.bluez.Error.Failed") says nothing; the message
+    alone does not say who refused.
+    """
+    if isinstance(exc, dbus.DBusException):
+        return "%s: %s" % (exc.get_dbus_name(),
+                           exc.get_dbus_message() or "no detail given")
+    return str(exc) or exc.__class__.__name__
 
 
 def _listener(psm):
@@ -277,6 +311,7 @@ class BluetoothHID:
     """Advertises us as a HID keyboard and carries reports to the host."""
 
     STATE_FILE = "/var/lib/btkey/host"
+    UNREAD = object()          # not "no host on record"
 
     #: How much of the wall clock went into waiting for the radio.  Class
     #: attributes so that a link built without __init__ - which is how the
@@ -321,6 +356,8 @@ class BluetoothHID:
         self._saved_adapter = {}
         self._connecting = False
         self._last_dial = 0
+        self._known_host = self.UNREAD
+        self._proxies = {}
 
     # -- lifecycle -------------------------------------------------------
 
@@ -328,10 +365,13 @@ class BluetoothHID:
         self._on_event(message)
 
     def start(self):
-        self.adapter_path = self._find_adapter()
-        self._configure_adapter()
-        self._register_agent()
-        self._register_profile()
+        try:
+            self.adapter_path = self._find_adapter()
+            self._configure_adapter()
+            self._register_agent()
+            self._register_profile()
+        except dbus.DBusException as exc:
+            raise LinkError(describe(exc)) from exc
         for psm in (hidspec.PSM_CONTROL, hidspec.PSM_INTERRUPT):
             sock = _listener(psm)
             self._listeners[psm] = sock
@@ -350,15 +390,12 @@ class BluetoothHID:
             sock.close()
         self._listeners = {}
         try:
-            manager = dbus.Interface(self.bus.get_object(BLUEZ, "/org/bluez"),
-                                     PROFILE_MANAGER_IFACE)
-            manager.UnregisterProfile(PROFILE_PATH)
+            self._manager(PROFILE_MANAGER_IFACE).UnregisterProfile(
+                PROFILE_PATH)
         except dbus.DBusException:
             pass
         try:
-            manager = dbus.Interface(self.bus.get_object(BLUEZ, "/org/bluez"),
-                                     AGENT_MANAGER_IFACE)
-            manager.UnregisterAgent(AGENT_PATH)
+            self._manager(AGENT_MANAGER_IFACE).UnregisterAgent(AGENT_PATH)
         except dbus.DBusException:
             pass
         self._restore_adapter()
@@ -375,9 +412,34 @@ class BluetoothHID:
                 return str(path)
         raise ProfileNotAvailable("no Bluetooth adapter found")
 
+    def _proxy(self, path, interface):
+        """A BlueZ interface, built once and kept.
+
+        Every dbus.Interface(bus.get_object(...)) costs a GetNameOwner to
+        the bus daemon and an Introspect of the object, both blocking and
+        both on the main loop, before the call anyone wanted is sent.
+        Keeping them turns a property read from three round trips into
+        one.  Note that the introspection cannot simply be turned off:
+        Properties.Set takes a variant, and dbus-python needs the
+        signature to know to wrap the value in one.
+        """
+        proxy = self._proxies.get((path, interface))
+        if proxy is None:
+            proxy = dbus.Interface(self.bus.get_object(BLUEZ, path),
+                                   interface)
+            self._proxies[(path, interface)] = proxy
+        return proxy
+
+    def _manager(self, interface):
+        return self._proxy("/org/bluez", interface)
+
+    def _device(self, addr, interface):
+        """One paired device, by address.  BlueZ spells it dev_AA_BB_..."""
+        return self._proxy("%s/dev_%s" % (self.adapter_path,
+                                          addr.replace(":", "_")), interface)
+
     def _adapter_props(self):
-        return dbus.Interface(self.bus.get_object(BLUEZ, self.adapter_path),
-                              PROPERTIES_IFACE)
+        return self._proxy(self.adapter_path, PROPERTIES_IFACE)
 
     def _configure_adapter(self):
         props = self._adapter_props()
@@ -414,8 +476,7 @@ class BluetoothHID:
 
     def _register_agent(self):
         self.agent = Agent(self.bus, AGENT_PATH, self)
-        manager = dbus.Interface(self.bus.get_object(BLUEZ, "/org/bluez"),
-                                 AGENT_MANAGER_IFACE)
+        manager = self._manager(AGENT_MANAGER_IFACE)
         manager.RegisterAgent(AGENT_PATH, self.capability)
         manager.RequestDefaultAgent(AGENT_PATH)
         self.event("pairing agent registered with capability %s"
@@ -423,8 +484,7 @@ class BluetoothHID:
 
     def _register_profile(self):
         self.profile = Profile(self.bus, PROFILE_PATH, self)
-        manager = dbus.Interface(self.bus.get_object(BLUEZ, "/org/bluez"),
-                                 PROFILE_MANAGER_IFACE)
+        manager = self._manager(PROFILE_MANAGER_IFACE)
         options = {
             "Name": self.name,
             "Role": "server",
@@ -460,10 +520,16 @@ class BluetoothHID:
             if interface == ADAPTER_IFACE and "Class" in changed_properties:
                 callback(int(changed_properties["Class"]))
 
-        return self.bus.add_signal_receiver(
-            changed, signal_name="PropertiesChanged",
-            dbus_interface=PROPERTIES_IFACE, path=self.adapter_path,
-            path_keyword="path")
+        try:
+            return self.bus.add_signal_receiver(
+                changed, signal_name="PropertiesChanged",
+                dbus_interface=PROPERTIES_IFACE, path=self.adapter_path,
+                path_keyword="path")
+        except dbus.DBusException as exc:
+            # Worth carrying on without: the backstop below still puts
+            # the class back, just less promptly.
+            self.event("cannot watch the class of device: %s" % describe(exc))
+            return None
 
     def all_uuids(self):
         try:
@@ -474,16 +540,8 @@ class BluetoothHID:
 
     def audio_profiles(self):
         """Audio-related UUIDs the adapter currently advertises."""
-        known = {"0000110a": "A2DP Source", "0000110b": "A2DP Sink",
-                 "0000110c": "AVRCP Target", "0000110e": "AVRCP",
-                 "0000111e": "Handsfree", "0000111f": "Handsfree AG",
-                 "00001108": "Headset", "00001112": "Headset AG"}
-        try:
-            uuids = self._adapter_props().Get(ADAPTER_IFACE, "UUIDs")
-        except dbus.DBusException:
-            return []
-        return [known[str(uuid)[:8]] for uuid in uuids
-                if str(uuid)[:8] in known]
+        return [AUDIO_UUIDS[uuid[:8]] for uuid in self.all_uuids()
+                if uuid[:8] in AUDIO_UUIDS]
 
     # -- pairing ---------------------------------------------------------
 
@@ -511,6 +569,10 @@ class BluetoothHID:
     #: audio here.  Connecting it is asking the phone to open that channel.
     A2DP_SOURCE_UUID = "0000110a-0000-1000-8000-00805f9b34fb"
 
+    #: What BlueZ says when it is in the middle of something else.  Worth
+    #: asking again for; the rest are answers rather than delays.
+    BUSY_ERRORS = ("org.bluez.Error.InProgress", "org.bluez.Error.Busy")
+
     def connect_audio(self, addr):
         """Ask the phone to bring up its audio channel as well as the keyboard.
 
@@ -522,18 +584,18 @@ class BluetoothHID:
         the class of device, the A2DP Sink endpoints - and the audio simply
         does not arrive, with nothing anywhere saying why.
 
-        Returns a message about what happened, since a failure here costs
-        nothing but the audio and should not stop anything else.
+        Returns what happened and whether it is worth asking again,
+        since a failure here costs nothing but the audio and should not
+        stop anything else.
         """
-        path = "%s/dev_%s" % (self.adapter_path, addr.replace(":", "_"))
         try:
-            device = dbus.Interface(self.bus.get_object(BLUEZ, path),
-                                    DEVICE_IFACE)
-            device.ConnectProfile(self.A2DP_SOURCE_UUID)
+            self._device(addr, DEVICE_IFACE).ConnectProfile(
+                self.A2DP_SOURCE_UUID)
         except dbus.DBusException as exc:
-            return "no audio channel: %s" % (exc.get_dbus_message()
-                                             or exc.get_dbus_name())
-        return "audio channel connected"
+            name = exc.get_dbus_name()
+            return ("no audio channel: %s" % (exc.get_dbus_message() or name),
+                    name in self.BUSY_ERRORS)
+        return "audio channel connected", False
 
     #: Apple, Inc. in the Bluetooth SIG's company identifiers.  It is what
     #: a phone puts in its own Device ID record, so this is the host saying
@@ -548,31 +610,34 @@ class BluetoothHID:
         the company.  A host that publishes no such record has no answer
         here, which is different from answering that it is not Apple.
         """
-        path = "%s/dev_%s" % (self.adapter_path, addr.replace(":", "_"))
         try:
-            props = dbus.Interface(self.bus.get_object(BLUEZ, path),
-                                   PROPERTIES_IFACE)
-            modalias = str(props.Get(DEVICE_IFACE, "Modalias"))
+            modalias = str(self._device(addr, PROPERTIES_IFACE)
+                           .Get(DEVICE_IFACE, "Modalias"))
         except dbus.DBusException:
             return None
         found = re.match(r"bluetooth:v([0-9A-Fa-f]{4})", modalias)
         return int(found.group(1), 16) if found else None
 
     def trust(self, addr):
-        path = "%s/dev_%s" % (self.adapter_path, addr.replace(":", "_"))
         try:
-            props = dbus.Interface(self.bus.get_object(BLUEZ, path),
-                                   PROPERTIES_IFACE)
-            props.Set(DEVICE_IFACE, "Trusted", dbus.Boolean(True))
-        except dbus.DBusException:
-            pass
+            self._device(addr, PROPERTIES_IFACE).Set(
+                DEVICE_IFACE, "Trusted", dbus.Boolean(True))
+        except dbus.DBusException as exc:
+            # A phone that never got marked trusted asks again later, and
+            # nothing would say why.
+            self.event("could not mark %s trusted: %s"
+                       % (addr, exc.get_dbus_message() or exc.get_dbus_name()))
 
     # -- connection management -------------------------------------------
 
     def _on_incoming(self, fd, condition, psm):
         try:
             conn, address = self._listeners[psm].accept()
-        except OSError:
+        except OSError as exc:
+            if not fifo.keep_watching(exc):
+                self.event("listener on PSM %d failed: %s"
+                           % (psm, exc.strerror))
+                return False
             return True
         peer = address[0]
 
@@ -639,6 +704,7 @@ class BluetoothHID:
     # -- outbound reconnect ----------------------------------------------
 
     def _remember_host(self, addr):
+        self._known_host = addr
         try:
             os.makedirs(os.path.dirname(self.STATE_FILE), exist_ok=True)
             with open(self.STATE_FILE, "w") as handle:
@@ -647,11 +713,22 @@ class BluetoothHID:
             pass
 
     def last_host(self):
-        try:
-            with open(self.STATE_FILE) as handle:
-                return handle.read().strip() or None
-        except OSError:
-            return None
+        """The host that paired with us, or None.
+
+        Kept in hand once read.  reconnect() asks on every key event
+        while the link is down - that is the point of it, a real keyboard
+        wakes its host - and it asks before the rate limit below has had
+        a chance to say no, so this was three syscalls per keystroke to
+        answer a question whose answer this class is the only thing that
+        ever changes.
+        """
+        if self._known_host is self.UNREAD:
+            try:
+                with open(self.STATE_FILE) as handle:
+                    self._known_host = handle.read().strip() or None
+            except OSError:
+                self._known_host = None
+        return self._known_host
 
     def reconnect(self):
         """Best-effort outbound connect to the host that paired with us.
@@ -747,38 +824,39 @@ class BluetoothHID:
 
     # -- HIDP control channel --------------------------------------------
 
-    def _on_control_data(self, fd, condition):
-        sock = self.control
+    def _read_channel(self, kind, condition):
+        """One channel's incoming data, or None once it has gone.
+
+        The two channels are read the same way and torn down the same
+        way, which is worth having in one place: an error path fixed on
+        one of them and not the other leaves half a link standing.
+        """
+        sock = getattr(self, kind)
         if sock is None:
-            return False
+            return None
         if condition & (GLib.IOCondition.HUP | GLib.IOCondition.ERR):
-            self.disconnect("control channel closed")
-            return False
+            self.disconnect("%s channel closed" % kind)
+            return None
         try:
             data = sock.recv(1024)
         except OSError:
-            self.disconnect("control channel error")
-            return False
+            self.disconnect("%s channel error" % kind)
+            return None
         if not data:
-            self.disconnect("control channel closed")
+            self.disconnect("%s channel closed" % kind)
+            return None
+        return data
+
+    def _on_control_data(self, fd, condition):
+        data = self._read_channel("control", condition)
+        if data is None:
             return False
         self._handle_control(data)
         return True
 
     def _on_interrupt_data(self, fd, condition):
-        sock = self.interrupt
-        if sock is None:
-            return False
-        if condition & (GLib.IOCondition.HUP | GLib.IOCondition.ERR):
-            self.disconnect("interrupt channel closed")
-            return False
-        try:
-            data = sock.recv(1024)
-        except OSError:
-            self.disconnect("interrupt channel error")
-            return False
-        if not data:
-            self.disconnect("interrupt channel closed")
+        data = self._read_channel("interrupt", condition)
+        if data is None:
             return False
         # Hosts push output reports here rather than on the control
         # channel - the kernel's own HIDP does.  Same shape as the control
@@ -842,6 +920,7 @@ class BluetoothHID:
     def _handle_hid_control(self, param):
         if param == HID_CONTROL_VIRTUAL_CABLE_UNPLUG:
             self.event("host unplugged the virtual cable")
+            self._known_host = None
             try:
                 os.unlink(self.STATE_FILE)
             except OSError:
@@ -895,6 +974,13 @@ class BluetoothHID:
         self.sent_reports += 1
         self.send_seconds += time.monotonic() - started
 
+
+#: The audio profiles worth naming when reporting what the adapter
+#: advertises, by the short form of their UUID.
+AUDIO_UUIDS = {"0000110a": "A2DP Source", "0000110b": "A2DP Sink",
+               "0000110c": "AVRCP Target", "0000110e": "AVRCP",
+               "0000111e": "Handsfree", "0000111f": "Handsfree AG",
+               "00001108": "Headset", "00001112": "Headset AG"}
 
 #: Short forms for the standing status-line indicator.  Only the locks are
 #: worth the width; Compose and Kana never change on the phones this sees.

@@ -55,6 +55,7 @@ class Display:
         self.split = self.rows >= MIN_ROWS
         self.started = False
         self.indicator = ""
+        self.borrowed = None       # a transient shown in the slot instead
         self.last_status = ""
 
     # -- geometry ---------------------------------------------------------
@@ -166,10 +167,35 @@ class Display:
         if text == self.indicator:
             return
         self.indicator = text
+        if self.borrowed is None:
+            self._repaint_status()
+
+    @property
+    def shown_indicator(self):
+        """What is in the slot: the borrowed text, or the standing one."""
+        return self.indicator if self.borrowed is None else self.borrowed
+
+    def borrow_indicator(self, text):
+        """Show something else in the slot, keeping the standing one.
+
+        The probe puts its percentage here for the minute it runs.  It
+        gives the slot back rather than putting the lock keys back
+        itself, which would mean knowing what was in it.
+        """
+        if text == self.borrowed:
+            return
+        self.borrowed = text
+        self._repaint_status()
+
+    def return_indicator(self):
+        if self.borrowed is None:
+            return
+        self.borrowed = None
         self._repaint_status()
 
     def _status_line(self):
-        parts = [part for part in (self.indicator, self.last_status) if part]
+        parts = [part for part in (self.shown_indicator, self.last_status)
+                 if part]
         return " ".join(parts)[:self.columns]
 
     def _repaint_status(self):

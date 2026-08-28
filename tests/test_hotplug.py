@@ -12,7 +12,6 @@ These run a real Gio.FileMonitor over a real directory and a real main
 loop, with the session pointed at that directory in place of /dev/input.
 """
 
-import ast
 import os
 import shutil
 import sys
@@ -21,12 +20,12 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from gi.repository import GLib
+from gi.repository import Gio, GLib
 
 from btkey import evdev, session as session_module
 
 from test_grab import RecordingDevice, keyboard_factory
-from test_keys import make_session
+from test_keys import (calls_in, capture_timers, make_session, source_of)
 
 
 def run_loop(milliseconds):
@@ -44,6 +43,14 @@ class HotplugNoticeTest(unittest.TestCase):
         evdev.DEVICE_DIRECTORY = self.directory
         self.addCleanup(setattr, evdev, "DEVICE_DIRECTORY",
                         self.real_directory)
+        # The shipped wait is a second, most of it there to give another
+        # program time to claim the keyboard.  What these check is the
+        # debouncing, which is the same at any length, so shorten it
+        # rather than spend ten seconds proving it.  ShippedSettleTest
+        # below holds the real value to its reasons.
+        self.addCleanup(setattr, session_module, "DEVICE_SETTLE_MS",
+                        session_module.DEVICE_SETTLE_MS)
+        session_module.DEVICE_SETTLE_MS = 60
         self.looks = []
 
     def session(self, *devices):
@@ -112,6 +119,42 @@ class HotplugNoticeTest(unittest.TestCase):
         run_loop(session_module.DEVICE_SETTLE_MS + 300)
         self.assertEqual(len(self.looks), 1, self.looks)
 
+    def test_a_loopback_appearing_late_still_lands_in_the_same_look(self):
+        """The case the wait is really for.
+
+        Something else grabs the keyboard and publishes what it does not
+        want through uinput; that loopback is what btkey should hold.  It
+        is created after the grab, so it arrives partway through the
+        wait, and restarting the wait at every arrival is what makes one
+        look see both of them.
+        """
+        session = self.session()
+        session.watch_for_devices()
+        self.touch("event99")                       # the keyboard
+        run_loop(session_module.DEVICE_SETTLE_MS // 2)
+        self.assertEqual(self.looks, [])            # still waiting
+        self.touch("event100")                      # its uinput loopback
+        run_loop(session_module.DEVICE_SETTLE_MS + 300)
+        self.assertEqual(len(self.looks), 1, self.looks)
+
+    def test_arrivals_keep_pushing_the_look_back(self):
+        """Restarted at every one, not run once from the first.
+
+        With a fixed delay from the first arrival, a stream of them
+        lasting longer than the wait gets a look part way through and
+        another after, each seeing a half-built picture.  Restarting
+        means one look, once everything has stopped moving.
+        """
+        session = self.session()
+        session.watch_for_devices()
+        settle = session_module.DEVICE_SETTLE_MS
+        for index in range(6):
+            self.touch("event9%d" % index)
+            run_loop(max(1, settle // 3))
+        self.assertEqual(self.looks, [], "looked while nodes were arriving")
+        run_loop(settle + 300)
+        self.assertEqual(len(self.looks), 1, self.looks)
+
     def test_nothing_is_looked_at_before_the_node_has_settled(self):
         session = self.session()
         session.watch_for_devices()
@@ -135,6 +178,34 @@ class HotplugNoticeTest(unittest.TestCase):
         run_loop(session_module.DEVICE_SETTLE_MS + 300)
         self.assertTrue(device.grabbed)
 
+    def test_a_keyboard_arriving_while_away_is_not_watched(self):
+        """Nothing is read from it until the screen comes back.
+
+        The set closes what discovery opened while it is asleep, which
+        test_grab covers; what matters here is that no watch is left on a
+        descriptor that is about to be closed.
+        """
+        session = self.session()
+        session.set_foreground(False)
+        arrival = RecordingDevice("/new")
+        session.keyboards.refresh = lambda: ([arrival], [])
+        session.watch_for_devices()
+        self.touch("event99")
+        run_loop(session_module.DEVICE_SETTLE_MS + 300)
+        self.assertNotIn("/new", session.watches)
+
+    def test_a_keyboard_arriving_while_we_have_the_screen_is_watched(self):
+        session = self.session()
+        session.foreground = False
+        session.set_foreground(True)
+        arrival = RecordingDevice("/new")
+        session.keyboards.refresh = lambda: ([arrival], [])
+        session.watch_for_devices()
+        self.touch("event99")
+        run_loop(session_module.DEVICE_SETTLE_MS + 300)
+        self.assertFalse(arrival.closed)
+        self.assertIn("/new", session.watches)
+
     def test_a_keyboard_arriving_while_another_console_has_it_is_not(self):
         # Grabbing from the background would take the keys away from
         # whoever is using that console.
@@ -146,6 +217,64 @@ class HotplugNoticeTest(unittest.TestCase):
         self.touch("event99")
         run_loop(session_module.DEVICE_SETTLE_MS + 300)
         self.assertFalse(device.grabbed)
+
+    def test_dropping_the_watch_gives_the_monitor_up(self):
+        """Cancelled, not merely forgotten.
+
+        A GFileMonitor that is only dropped keeps its inotify watch and
+        its signal connection until the garbage collector gets round to
+        it, and goes on waking the process meanwhile.
+        """
+        session = self.session()
+        session.watch_for_devices()
+        monitor = session.device_monitor
+        session.unwatch_for_devices()
+        self.assertIsNone(session.device_monitor)
+        self.assertTrue(monitor.is_cancelled())
+
+    def test_watching_twice_keeps_one_monitor(self):
+        # Startup settles the foreground, which installs it; a switch
+        # away and back must not leave the first one behind.
+        session = self.session()
+        session.watch_for_devices()
+        monitor = session.device_monitor
+        session.watch_for_devices()
+        self.assertIs(session.device_monitor, monitor)
+
+    def test_a_change_still_settling_is_dropped_with_the_watch(self):
+        # It would fire on a console we no longer have, and rescan for
+        # keyboards we have just given back.
+        session = self.session()
+        session.watch_for_devices()
+        self.touch("event99")
+        run_loop(max(1, session_module.DEVICE_SETTLE_MS // 4))
+        self.assertIsNotNone(session.device_settle)
+        session.unwatch_for_devices()
+        self.assertIsNone(session.device_settle)
+        run_loop(session_module.DEVICE_SETTLE_MS + 300)
+        self.assertEqual(self.looks, [])
+
+    def test_the_fallback_timer_is_stopped_too(self):
+        session = self.session()
+        session.consoles.watch_fd = None
+        timers = []
+        real = session_module.GLib.timeout_add
+        removed = []
+        real_remove = session_module.GLib.source_remove
+        session_module.GLib.timeout_add = (
+            lambda ms, fn, *a: timers.append((ms, fn)) or 77)
+        session_module.GLib.source_remove = removed.append
+        try:
+            session.device_monitor = None
+            session.watch_for_devices = (
+                lambda: setattr(session, "device_timer", 77))
+            session.watch_for_devices()
+            session.unwatch_for_devices()
+        finally:
+            session_module.GLib.timeout_add = real
+            session_module.GLib.source_remove = real_remove
+        self.assertIn(77, removed)
+        self.assertIsNone(session.device_timer)
 
     def test_the_monitor_is_kept(self):
         # A GFileMonitor that nothing holds a reference to is collected,
@@ -162,22 +291,19 @@ class HotplugNoticeTest(unittest.TestCase):
         so this stubs the refusal rather than staging one.
         """
         session = self.session()
-        logged, timers = [], []
+        logged = []
         session.log = logged.append
 
         def refuse(*args, **kwargs):
             raise GLib.Error("too many open files")
 
-        real_new, real_timeout = session_module.Gio.File.new_for_path, \
-            GLib.timeout_add
+        real = session_module.Gio.File.new_for_path
         session_module.Gio.File.new_for_path = refuse
-        GLib.timeout_add = lambda ms, fn, *a: timers.append((ms, fn)) or 1
         try:
-            session.watch_for_devices()
+            timers = capture_timers(session.watch_for_devices)
         finally:
-            session_module.Gio.File.new_for_path = real_new
-            GLib.timeout_add = real_timeout
-        self.assertEqual([ms for ms, _ in timers],
+            session_module.Gio.File.new_for_path = real
+        self.assertEqual([ms for ms, _, _ in timers],
                          [session_module.DEVICE_RESCAN_MS])
         self.assertIs(timers[0][1], session.rescan_devices)
         self.assertIsNone(session.device_monitor)
@@ -204,32 +330,117 @@ class ComingBackTest(unittest.TestCase):
         self.assertLess(trace.index("look"), trace.index("grab /a"))
 
 
+class WatchOrderTest(unittest.TestCase):
+    """When the watch goes on and comes off, relative to everything else.
+
+    A keyboard plugged in between the scan and the watch being
+    established would fall through the gap: too late for the scan, too
+    early for a watch that did not exist yet, and unnoticed until the
+    next switch.  So the watch goes on first, and comes off last.
+    """
+
+    def trace(self):
+        session = make_session(keyboards=keyboard_factory())
+        session.foreground = False
+        order = []
+
+        def record(name, real):
+            def wrapper(*args, **kwargs):
+                order.append(name)
+                return real(*args, **kwargs)
+            return wrapper
+
+        for name in ("watch_for_devices", "unwatch_for_devices",
+                     "rescan_devices", "wake_devices", "sleep_devices"):
+            setattr(session, name, record(name, getattr(session, name)))
+        return session, order
+
+    def test_the_watch_goes_on_before_the_look(self):
+        session, order = self.trace()
+        session.set_foreground(True)
+        self.assertLess(order.index("watch_for_devices"),
+                        order.index("rescan_devices"))
+
+    def test_the_watch_goes_on_before_the_devices_are_opened(self):
+        session, order = self.trace()
+        session.set_foreground(True)
+        self.assertLess(order.index("watch_for_devices"),
+                        order.index("wake_devices"))
+
+    def test_the_watch_comes_off_before_the_devices_are_closed(self):
+        """The same race the other way round.
+
+        An arrival reported after we have let go would have us open and
+        grab a keyboard on a console that is no longer ours.
+        """
+        session, order = self.trace()
+        session.set_foreground(True)
+        session.set_foreground(False)
+        self.assertLess(order.index("unwatch_for_devices"),
+                        order.index("sleep_devices"))
+
+    def test_an_event_that_arrives_after_the_cancel_is_ignored(self):
+        # GIO can have one queued already when the monitor is cancelled.
+        session, order = self.trace()
+        session.set_foreground(True)
+        session.set_foreground(False)
+        session.device_directory_changed(None, None, None,
+                                         Gio.FileMonitorEvent.CREATED)
+        self.assertIsNone(session.device_settle)
+
+
+class ShippedSettleTest(unittest.TestCase):
+    """How long the real wait is, and why it is that long.
+
+    Three things have to have happened before the look is worth making,
+    and the slowest is not btkey's at all: whatever else on this machine
+    wants the keyboard should get it first, and publish what it does not
+    want through uinput, because that loopback is the device btkey should
+    be holding.  BRLTTY does exactly this.
+    """
+
+    def test_it_is_long_enough_for_another_program_to_claim_it(self):
+        self.assertGreaterEqual(session_module.DEVICE_SETTLE_MS, 1000)
+
+    def test_it_is_short_enough_to_go_unnoticed(self):
+        # Against the act of plugging a keyboard in.
+        self.assertLessEqual(session_module.DEVICE_SETTLE_MS, 3000)
+
+    def test_each_arrival_restarts_it(self):
+        """Which is what makes the wait cover the loopback at all.
+
+        The loopback is created after the keyboard is grabbed, so it
+        arrives during the wait and pushes the end of it out; btkey looks
+        once everything has stopped moving.
+        """
+        source = source_of("session.py")
+        self.assertIn("GLib.source_remove(self.device_settle)", source)
+
+
 class HotplugWiringTest(unittest.TestCase):
-    """That startup asks to be told, and sets no rescan of its own going."""
+    """That the watch follows the foreground, and nothing polls beside it."""
 
     def setUp(self):
-        source = os.path.join(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__))), "btkey", "session.py")
-        with open(source, encoding="utf-8") as handle:
-            tree = ast.parse(handle.read())
-        self.functions = {node.name: node for node in ast.walk(tree)
-                          if isinstance(node, ast.FunctionDef)}
+        self.run_calls = calls_in("session.py", "run")
+        self.switch_calls = calls_in("session.py", "set_foreground")
 
-    def calls_in(self, name):
-        return {ast.unparse(node.func)
-                for node in ast.walk(self.functions[name])
-                if isinstance(node, ast.Call)}
+    def test_startup_settles_the_foreground(self):
+        # Which is what puts the watch in place, our console being in
+        # front at startup: btkey was just typed at it.
+        self.assertIn("self.poll_foreground()", self.run_calls)
 
-    def test_startup_asks_to_be_told(self):
-        self.assertIn("self.watch_for_devices", self.calls_in("run"))
+    def test_taking_the_screen_asks_to_be_told(self):
+        self.assertIn("self.watch_for_devices()", self.switch_calls)
 
-    def test_startup_starts_no_rescan_of_its_own(self):
-        started = {ast.unparse(node)
-                   for node in ast.walk(self.functions["run"])
-                   if isinstance(node, ast.Call)
-                   and ast.unparse(node.func) == "GLib.timeout_add"}
-        self.assertFalse([call for call in started
-                          if "DEVICE_RESCAN_MS" in call], started)
+    def test_giving_it_up_stops_being_told(self):
+        # A keyboard plugged in while another console has the screen is
+        # that console's business, and we look afresh on the way back.
+        self.assertIn("self.unwatch_for_devices()", self.switch_calls)
+
+    def test_nothing_starts_a_rescan_of_its_own(self):
+        for calls in (self.run_calls, self.switch_calls):
+            self.assertFalse([call for call in calls
+                              if "DEVICE_RESCAN_MS" in call], calls)
 
 
 if __name__ == "__main__":

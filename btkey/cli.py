@@ -13,10 +13,9 @@ import os
 import stat
 import sys
 
-import dbus.mainloop.glib
 
-from . import (__version__, config, evdev, from_checkout, guardian,
-               hidspec, kbmap, pairing, probe, single, vt)
+from . import (__version__, btlink, config, evdev, from_checkout,
+               guardian, hidspec, kbmap, pairing, probe, single, vt)
 from .session import Session, started_by
 
 
@@ -71,15 +70,19 @@ def grab_state(device):
 
 #: Control-FIFO command for each thing a second btkey can ask the first to
 #: do.  The names are what the person typing them would call it.
+# Name on the wire, what to say we asked for, and whether there is a wait
+# worth telling the caller about.  Only the probes have one: they type for
+# minutes and ring the bell at the end, which is the signal to start
+# reading.  The others are done by the time the message is printed.
 COMMANDS = {
     "learn_layout": ("learn-layout",
-                     "typing the layout probe"),
+                     "typing the layout probe", True),
     "learn_accents": ("learn-accents",
-                      "typing the accent probe"),
+                      "typing the accent probe", True),
     "cancel": ("cancel",
-               "cancelling whatever it was typing"),
+               "cancelling whatever it was typing", False),
     "quit": ("quit",
-             "stopping"),
+             "stopping", False),
 }
 
 
@@ -145,7 +148,7 @@ def send_command(path, name, argument=""):
     which is a better answer than silently writing into a file nobody will
     ever read.
     """
-    command, description = COMMANDS[name]
+    command, description, waits = COMMANDS[name]
     if argument:
         command += " " + argument
     # A path that exists is not necessarily a FIFO.  An earlier `echo`
@@ -173,8 +176,10 @@ def send_command(path, name, argument=""):
         os.write(handle, (command + "\n").encode())
     finally:
         os.close(handle)
-    sys.stderr.write("btkey: %s.  It rings the console bell when done.\n"
-                     % description)
+    message = "btkey: %s." % description
+    if waits:
+        message += "  It rings the console bell when done."
+    sys.stderr.write(message + "\n")
     return 0
 
 
@@ -411,6 +416,18 @@ def default_log_file():
     return DEFAULT_LOG_FILE if from_checkout() else ""
 
 
+def long_options(parser, wanted):
+    """The --long names, without the dashes, whose action `wanted` accepts.
+
+    argparse has no public way to ask what it was given, so this is the
+    one place that reaches for the private list; the three questions
+    below differ only in what they ask of each action.
+    """
+    return {option[2:] for action in parser._actions     # noqa: SLF001
+            for option in action.option_strings
+            if wanted(action) and option.startswith("--")}
+
+
 def optional_values(parser):
     """The options whose value may be left empty in a file.
 
@@ -418,9 +435,7 @@ def optional_values(parser):
     optionally in a file too: `log-file =` is the file turned off, exactly
     as `--log-file=` is.  Read from the parser so the two cannot drift.
     """
-    return {option[2:] for action in parser._actions     # noqa: SLF001
-            for option in action.option_strings
-            if action.nargs == "?" and option.startswith("--")}
+    return long_options(parser, lambda action: action.nargs == "?")
 
 
 def switch_values(parser):
@@ -432,9 +447,7 @@ def switch_values(parser):
     towards an empty value instead: one of them takes a word and the other
     takes a path.
     """
-    return {option[2:] for action in parser._actions     # noqa: SLF001
-            for option in action.option_strings
-            if action.type is switch and option.startswith("--")}
+    return long_options(parser, lambda action: action.type is switch)
 
 
 def flag_options(parser):
@@ -453,9 +466,7 @@ def flag_options(parser):
     # A switch whose name is the negative of an option that takes a value
     # belongs to that option: --no-log-file turns --log-file off, and
     # `log-file` in a file is a path, not a yes or a no.
-    valued = {option[2:] for action in parser._actions  # noqa: SLF001
-              for option in action.option_strings
-              if action.nargs != 0 and option.startswith("--")}
+    valued = long_options(parser, lambda action: action.nargs != 0)
 
     flags = {}
     for action in parser._actions:                     # noqa: SLF001
@@ -569,7 +580,7 @@ def main(argv=None):
     # exists, so it inherits nothing it would then hold open.
     keeper = guardian.spawn()
     keeper.reset_console_on_death(consoles.vt)
-    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    btlink.use_glib_mainloop()
     try:
         return Session(options, consoles, keeper).run()
     finally:

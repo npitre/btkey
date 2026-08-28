@@ -221,14 +221,15 @@ None need root, a phone, or a Bluetooth controller.
 | `session.py` | main loop, key handling, chords, reports |
 | `btlink.py` | SDP record, pairing agent, L2CAP, the HIDP control channel |
 | `evdev.py` | device discovery, grab, key and LED state |
-| `btd.py` | the private bluetoothd, and the class of device |
+| `btd.py` | the private bluetoothd |
 | `probe.py` | measuring the phone's layout |
+| `sweep.py` | typing a probe at the phone, and saying how far it has got |
 | `guardian.py` | cleanup and the watchdog, for when btkey dies badly |
 | `kbmap.py` | the console keymap, and layout files |
 | `typist.py` | text arriving on the console, typed out as key positions |
 | `escapes.py` | the keys that arrive as escape sequences rather than text |
 | `display.py` | the split console |
-| `advertising.py` | what the machine tells the world it is |
+| `advertising.py` | what the machine tells the world it is, class of device included |
 | `pairing.py` | the passkey state machine |
 | `journal.py` | the log file |
 | `fifo.py` | the control FIFO, and who is allowed to write to it |

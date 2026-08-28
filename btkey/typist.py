@@ -32,7 +32,7 @@ import termios
 
 from gi.repository import GLib
 
-from . import escapes, kbmap, keycodes
+from . import escapes, fifo, kbmap, keycodes
 
 # One HID report per tick.  Most characters cost one report - see
 # _stroke - so this is upwards of a hundred a second, fast enough not to
@@ -181,7 +181,7 @@ class Typist:
                 for keycode, modifiers in value:
                     usage = keycodes.KEYBOARD.get(keycode)
                     if usage is None:
-                        unknown.append(escapes.KEY_NAMES.get(keycode, "?"))
+                        unknown.append(keycodes.key_name(keycode))
                     else:
                         self._stroke(modifiers, usage)
                 continue
@@ -312,8 +312,8 @@ class Typist:
     def on_text_input(self, fd, condition):
         try:
             data = os.read(fd, 4096)
-        except OSError:
-            return True
+        except OSError as exc:
+            return fifo.keep_watching(exc)
         if not data:
             return False
         # Only while our console is in front: text arriving on a

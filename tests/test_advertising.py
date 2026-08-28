@@ -110,6 +110,139 @@ class PutBackTest(unittest.TestCase):
         self.assertEqual(self.agent.cod.written, [self.agent.wanted_class()])
 
 
+class StartTest(unittest.TestCase):
+    """What start() puts in place, without letting it near the controller."""
+
+    def setUp(self):
+        self.agent, self.link = make()
+        self.addCleanup(setattr, advertising, "ClassOfDevice",
+                        advertising.ClassOfDevice)
+        advertising.ClassOfDevice = lambda on_event=None: FakeCod()
+        timer = advertising.GLib.timeout_add_seconds
+        advertising.GLib.timeout_add_seconds = lambda *args: 1
+        self.addCleanup(setattr, advertising.GLib, "timeout_add_seconds",
+                        timer)
+
+    def test_it_records_the_class_being_advertised(self):
+        # What the backstop compares against.  Without it the first look
+        # finds a difference no signal was ever going to account for, and
+        # reports a lost signal on every run.
+        self.link.cod = 0x0c0104
+        self.agent.start()
+        self.assertEqual(self.agent.seen, 0x0c0104)
+
+    def test_it_watches_for_the_class_moving(self):
+        self.agent.start()
+        self.assertIsNotNone(self.link.watch)
+
+    def test_no_audio_puts_nothing_in_place(self):
+        agent, link = make(audio=False)
+        agent.start()
+        self.assertIsNone(link.watch)
+
+
+class BackstopTest(unittest.TestCase):
+    """Whether the five-second backstop is earning its wakeups.
+
+    It reads the same property the PropertiesChanged watch reports, so it
+    can only ever catch a signal that went missing.  Nothing said whether
+    that happens, so now it says so, and the answer decides whether it
+    stays.
+    """
+
+    # What bluetoothd puts back when it recomputes the class itself.
+    OVERWRITTEN = 0x0c0104
+
+    def setUp(self):
+        self.agent, self.link = make()
+        self.agent.cod = FakeCod()
+        self.logged = []
+        self.agent.log = self.logged.append
+        # What start() does, without the rest of it: the watch delivers
+        # into class_changed, and the settled state is what we asked for.
+        self.link.watch_class(self.agent.class_changed)
+        self.link.cod = self.agent.wanted_class()
+        self.agent.seen = self.link.cod
+
+    def blamed(self):
+        """The lines blaming a lost signal, not the ordinary put-back."""
+        return [line for line in self.logged if "no PropertiesChanged" in line]
+
+    def test_an_unchanged_class_says_nothing(self):
+        for _ in range(3):
+            self.agent.recheck()
+        self.assertEqual(self.logged, [])
+
+    def test_a_class_the_watch_reported_is_not_blamed_on_a_lost_signal(self):
+        self.link.cod = self.OVERWRITTEN
+        self.link.watch(self.OVERWRITTEN)          # the signal arrives
+        self.agent.recheck()
+        self.agent.recheck()
+        self.assertEqual(self.blamed(), [])
+
+    def test_one_look_is_not_enough_to_call_a_signal_missing(self):
+        """It may have been emitted and not yet dispatched.
+
+        Saying a signal was lost when it was merely in flight would send
+        whoever reads it looking for a bug in bluetoothd.
+        """
+        self.link.cod = self.OVERWRITTEN
+        self.agent.recheck()
+        self.assertEqual(self.blamed(), [])
+
+    def test_a_signal_in_flight_is_not_blamed_when_it_lands(self):
+        self.link.cod = self.OVERWRITTEN
+        self.agent.recheck()                       # noticed, not yet blamed
+        self.link.watch(self.OVERWRITTEN)          # and here it comes
+        self.agent.recheck()
+        self.assertEqual(self.blamed(), [])
+
+    def test_a_change_no_signal_accounted_for_is_reported(self):
+        self.link.cod = self.OVERWRITTEN
+        self.agent.recheck()
+        self.agent.recheck()
+        self.assertEqual(len(self.blamed()), 1, self.logged)
+
+    def test_it_is_blamed_once_and_not_every_five_seconds(self):
+        self.link.cod = self.OVERWRITTEN
+        for _ in range(6):
+            self.agent.recheck()
+        self.assertEqual(len(self.blamed()), 1, self.logged)
+
+    def test_a_second_lost_signal_is_reported_again(self):
+        self.link.cod = self.OVERWRITTEN
+        self.agent.recheck()
+        self.agent.recheck()
+        self.link.cod = self.OVERWRITTEN | 0x000008
+        self.agent.recheck()
+        self.agent.recheck()
+        self.assertEqual(len(self.blamed()), 2, self.logged)
+
+    def test_a_class_it_cannot_read_is_not_a_lost_signal(self):
+        self.link.cod = None
+        self.agent.recheck()
+        self.agent.recheck()
+        self.assertEqual(self.blamed(), [])
+
+    def test_it_puts_the_class_back_on_the_first_look(self):
+        """Deciding whose fault it is must not delay the correction.
+
+        Waiting for the second look to be sure a signal was lost would
+        leave the wrong class advertised for another RECHECK_SECONDS,
+        which is the very window the watch exists to keep short.
+        """
+        self.link.cod = self.OVERWRITTEN
+        self.agent.recheck()
+        self.assertEqual(self.agent.cod.written, [self.agent.wanted_class()])
+        self.assertEqual(self.blamed(), [])
+
+    def test_it_puts_the_class_back_once_not_at_every_look(self):
+        self.link.cod = self.OVERWRITTEN
+        for _ in range(5):
+            self.agent.recheck()
+        self.assertEqual(self.agent.cod.written, [self.agent.wanted_class()])
+
+
 class ChangeNoticeTest(unittest.TestCase):
     """Saying what moved, not only that something did.
 

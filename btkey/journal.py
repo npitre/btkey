@@ -22,6 +22,8 @@ import time
 
 from gi.repository import GLib
 
+from . import fifo
+
 
 class Journal:
     def __init__(self, path, on_error=None):
@@ -104,8 +106,8 @@ class Journal:
     def _on_stderr(self, fd, condition, on_line):
         try:
             data = os.read(fd, 4096)
-        except OSError:
-            return True
+        except OSError as exc:
+            return fifo.keep_watching(exc)
         if not data:
             return False
         self.buffer += data

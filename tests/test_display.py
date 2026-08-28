@@ -237,5 +237,61 @@ class FallbackTest(unittest.TestCase):
         self.assertEqual(stream.text, "important\n")
 
 
+
+class BorrowedIndicatorTest(unittest.TestCase):
+    """The probe puts its percentage where the lock keys usually go.
+
+    It borrows the slot rather than overwriting it, so it can hand the
+    slot back at the end without having to know what was in it, and a
+    lock key pressed during the minute it runs is not lost.
+    """
+
+    def setUp(self):
+        self.screen, self.stream = make_display()
+        # Started, or _repaint_status returns before writing anything and
+        # the repaint assertions below would hold whatever the code did.
+        self.screen.start()
+        self.screen.set_indicator("CAPS")
+
+    def test_borrowing_shows_the_borrowed_text(self):
+        self.screen.borrow_indicator("40%")
+        self.assertEqual(self.screen.shown_indicator, "40%")
+
+    def test_the_standing_one_is_kept(self):
+        self.screen.borrow_indicator("40%")
+        self.assertEqual(self.screen.indicator, "CAPS")
+
+    def test_giving_it_back_shows_the_standing_one(self):
+        self.screen.borrow_indicator("40%")
+        self.screen.return_indicator()
+        self.assertEqual(self.screen.shown_indicator, "CAPS")
+
+    def test_a_change_underneath_is_kept_for_afterwards(self):
+        self.screen.borrow_indicator("40%")
+        self.screen.set_indicator("NUM CAPS")
+        self.assertEqual(self.screen.shown_indicator, "40%")
+        self.screen.return_indicator()
+        self.assertEqual(self.screen.shown_indicator, "NUM CAPS")
+
+    def test_a_change_underneath_costs_no_repaint(self):
+        # It would write the same line back: the slot is showing the
+        # percentage either way.
+        self.screen.borrow_indicator("40%")
+        self.stream.reset()
+        self.screen.set_indicator("NUM CAPS")
+        self.assertEqual(self.stream.text, "")
+
+    def test_the_same_percentage_twice_costs_no_repaint(self):
+        self.screen.borrow_indicator("40%")
+        self.stream.reset()
+        self.screen.borrow_indicator("40%")
+        self.assertEqual(self.stream.text, "")
+
+    def test_giving_back_what_was_never_borrowed_costs_nothing(self):
+        self.stream.reset()
+        self.screen.return_indicator()
+        self.assertEqual(self.stream.text, "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2 if "-v" in sys.argv else 1)

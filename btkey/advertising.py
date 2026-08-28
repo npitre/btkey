@@ -24,14 +24,19 @@ since its last run and says so.
 """
 
 import os
+import socket
+import struct
 
 from gi.repository import GLib
 
-from . import btd, hidspec
+from . import hidspec
 
 # How often to check that bluetoothd has not overwritten the class.  The
 # PropertiesChanged watch is the real mechanism; this is a backstop for a
-# change that arrives without a signal.
+# change that arrives without a signal.  Both read the same property, so
+# this can catch nothing else, and it says so out loud when it does: with
+# no evidence that a signal ever goes missing, the only thing this costs
+# is a wakeup every RECHECK_SECONDS for as long as btkey runs.
 RECHECK_SECONDS = 5
 # Long enough for bluetoothd and WirePlumber to have finished registering
 # everything, so the snapshot compared against the last run is the settled
@@ -39,6 +44,45 @@ RECHECK_SECONDS = 5
 SETTLE_SECONDS = 8
 STATE_FILE = "/var/lib/btkey/advertised"
 
+
+class ClassOfDevice:
+    """Write the class of device with the HCI command directly.
+
+    Nothing in the D-Bus API exposes the service class bits, and
+    main.conf's Class is not honoured, for the reasons this module opens
+    with.  So they are written here and put back whenever bluetoothd
+    recomputes them.
+    """
+
+    OGF_HOST_CONTROL = 0x03
+    OCF_WRITE_CLASS_OF_DEV = 0x24
+    HCI_COMMAND_PKT = 0x01
+    HCI_CHANNEL_RAW = 0
+
+    def __init__(self, index=0, on_event=None):
+        self.index = index
+        self.event = on_event or (lambda message: None)
+
+    def write(self, cod):
+        """Send HCI_Write_Class_of_Device.  Returns True if it went out."""
+        opcode = (self.OGF_HOST_CONTROL << 10) | self.OCF_WRITE_CLASS_OF_DEV
+        packet = struct.pack("<BHB3s", self.HCI_COMMAND_PKT, opcode, 3,
+                             cod.to_bytes(3, "little"))
+        try:
+            sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW,
+                                 socket.BTPROTO_HCI)
+        except OSError as exc:
+            self.event("cannot open an HCI socket: %s" % exc.strerror)
+            return False
+        try:
+            sock.bind((self.index,))
+            sock.send(packet)
+            return True
+        except OSError as exc:
+            self.event("cannot set class of device: %s" % exc.strerror)
+            return False
+        finally:
+            sock.close()
 
 def service_bits(cod):
     """Spell out the class of device's service bits, which are the point."""
@@ -58,6 +102,8 @@ class Advertising:
         self.cod = None
         self.class_watch = None
         self.recheck_id = 0
+        self.seen = None            # what we were last told the class is
+        self.unsignalled = None     # a value the watch has not accounted for
 
     def wanted_class(self):
         """The class we want advertised, service bits included."""
@@ -73,7 +119,7 @@ class Advertising:
         if not self.options.audio:
             return
         wanted = self.wanted_class()
-        self.cod = btd.ClassOfDevice(on_event=self.log)
+        self.cod = ClassOfDevice(on_event=self.log)
         if self.cod.write(wanted):
             self.log("HCI_Write_Class_of_Device 0x%06x sent" % wanted)
         else:
@@ -86,6 +132,7 @@ class Advertising:
         # Watch rather than poll, so the window in which the wrong class is
         # being advertised stays as short as possible.
         self.class_watch = self.link.watch_class(self.class_changed)
+        self.seen = self.link.class_of_device()
         self.recheck_id = GLib.timeout_add_seconds(RECHECK_SECONDS,
                                                    self.recheck)
 
@@ -100,6 +147,11 @@ class Advertising:
             self.class_watch = None
 
     def class_changed(self, current):
+        """The class moved underneath us, and a signal said so."""
+        self.seen = current
+        self.put_back(current)
+
+    def put_back(self, current):
         wanted = self.wanted_class()
         if current & wanted == wanted or self.cod is None:
             return
@@ -108,9 +160,29 @@ class Advertising:
         self.cod.write(wanted)
 
     def recheck(self):
+        """The backstop, which reports when it is the one that noticed.
+
+        A signal that has been emitted but not yet dispatched would look
+        exactly like one that never came, so a difference has to survive
+        a second look before it is called missing.  The correction itself
+        does not wait for that.
+        """
         current = self.link.class_of_device()
-        if current is not None:
-            self.class_changed(current)
+        if current is None or current == self.seen:
+            self.unsignalled = None
+            return True
+        if self.unsignalled != current:
+            # Put it back now.  Which mechanism noticed is a question for
+            # the next look, not a reason to go on advertising the wrong
+            # class for another RECHECK_SECONDS.
+            self.unsignalled = current
+            self.put_back(current)
+            return True
+        self.unsignalled = None
+        self.seen = current
+        self.log("class of device is 0x%06x and no PropertiesChanged said "
+                 "so; the %d second backstop is doing the work"
+                 % (current, RECHECK_SECONDS))
         return True
 
     def report(self, when=""):

@@ -8,6 +8,7 @@ end-of-file and removes itself - a dead channel that has logged itself as
 working.
 """
 
+import errno
 import os
 import shutil
 import stat
@@ -146,7 +147,14 @@ class InvokingUserTest(unittest.TestCase):
         self.assertEqual(fifo.invoking_user(), (1000, 1000))
 
     def test_no_sudo_means_nobody_to_hand_it_to(self):
-        os.environ.pop("SUDO_UID", None)
+        # Put back whatever was there: this is the one test in the suite
+        # that changes the environment for good otherwise, and the file
+        # only gets away with it because each one runs in its own process.
+        for name in ("SUDO_UID", "SUDO_GID"):
+            if name in os.environ:
+                self.addCleanup(os.environ.__setitem__, name,
+                                os.environ[name])
+            os.environ.pop(name, None)
         self.assertIsNone(fifo.invoking_user())
 
     def test_nonsense_in_the_environment_is_not_fatal(self):
@@ -237,6 +245,54 @@ class SingleInstanceTest(unittest.TestCase):
         taken, other = single.hold("someone", self.path)
         self.assertIsNone(taken)
         self.assertEqual(other, "")
+
+
+
+class KeepWatchingTest(unittest.TestCase):
+    """Whether a failed read leaves a GLib watch worth keeping.
+
+    Every fd handler in btkey used to answer "carry on" to any OSError.
+    A descriptor in error is reported ready for ever, so that answer
+    turns the main loop into a busy loop for the rest of the run and
+    starves the keystroke path.  BRLTTY had to fix the same thing twice
+    in its own monitor.
+    """
+
+    def failure(self, number):
+        return OSError(number, os.strerror(number))
+
+    def test_nothing_to_read_just_now_is_carried_on_from(self):
+        for number in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
+            self.assertTrue(fifo.keep_watching(self.failure(number)),
+                            os.strerror(number))
+
+    def test_a_descriptor_in_error_is_let_go_of(self):
+        for number in (errno.EIO, errno.EBADF, errno.ENODEV, errno.EPIPE):
+            self.assertFalse(fifo.keep_watching(self.failure(number)),
+                             os.strerror(number))
+
+    def test_every_fd_handler_asks(self):
+        """The point is that all of them agree, not that one does.
+
+        Each of these reads a descriptor from inside the main loop, and
+        each one of them answered every error with "carry on" before.
+        """
+        import ast
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for module, function in (("session.py", "on_control"),
+                                 ("typist.py", "on_text_input"),
+                                 ("journal.py", "_on_stderr"),
+                                 ("btlink.py", "_on_incoming")):
+            with open(os.path.join(root, "btkey", module),
+                      encoding="utf-8") as handle:
+                tree = ast.parse(handle.read())
+            found = next(node for node in ast.walk(tree)
+                         if isinstance(node, ast.FunctionDef)
+                         and node.name == function)
+            calls = {ast.unparse(node.func) for node in ast.walk(found)
+                     if isinstance(node, ast.Call)}
+            self.assertIn("fifo.keep_watching", calls,
+                          "%s.%s swallows every error" % (module, function))
 
 
 if __name__ == "__main__":

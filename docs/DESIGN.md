@@ -7,8 +7,10 @@ by getting it wrong first, and the reasons are worth keeping.
 ## How it works
 
 * Keyboards are captured with `EVIOCGRAB` on their `/dev/input/event*`
-  devices, held only while our console is in the foreground; btkey polls
-  `VT_GETSTATE` on `/dev/tty0` to notice.  A grabbed device reaches no other
+  devices, held only while our console is in the foreground.  A change of
+  console is waited on rather than asked about: the VT layer notifies on
+  `/sys/class/tty/tty0/active`, so a `POLLPRI` watch on it wakes btkey at
+  the switch and at nothing else.  A grabbed device reaches no other
   in-kernel handler, so the console sees nothing while we forward, and the
   VT switch chords stop working: btkey implements Alt+F*n* itself with
   `VT_ACTIVATE`, and Alt+Escape to quit.

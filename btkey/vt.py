@@ -20,6 +20,17 @@ import struct
 VT_GETSTATE = 0x5603
 VT_ACTIVATE = 0x5606
 
+# The VT layer calls sysfs_notify on this attribute at every console
+# change, so a poll for POLLPRI on it waits for the next switch instead of
+# asking over and over whether one has happened.  It holds the console in
+# front, as "tty2".
+#
+# Its presence is all there is to check.  Waiting on it has worked for as
+# long as it has existed, and there is nothing a probe could add: an
+# unread sysfs attribute reports itself ready whether or not anything ever
+# notifies on it, so one would pass on a kernel that never says a word.
+ACTIVE_ATTRIBUTE = "/sys/class/tty/tty0/active"
+
 MAX_VT = 63
 
 
@@ -43,11 +54,52 @@ class Consoles:
         # Whatever console is in front when we start is the one the user
         # launched us from, which is the one they will switch back to.
         self.vt = vt if vt is not None else self.active()
+        self.watch_fd = None
 
     def close(self):
         if self.fd is not None:
             os.close(self.fd)
             self.fd = None
+        if self.watch_fd is not None:
+            os.close(self.watch_fd)
+            self.watch_fd = None
+
+    def watch(self):
+        """A descriptor that goes POLLPRI-ready when the console changes.
+
+        None where the attribute is not there, leaving the caller to fall
+        back on asking.  The read is what arms it: a sysfs attribute that
+        has not been read is ready from the outset, which would fire the
+        moment it is watched and again immediately after.
+        """
+        if self.watch_fd is not None:
+            return self.watch_fd
+        try:
+            self.watch_fd = os.open(ACTIVE_ATTRIBUTE, os.O_RDONLY)
+        except OSError:
+            return None
+        self.rearm()
+        return self.watch_fd
+
+    def rearm(self):
+        """Read the attribute back, which is what clears the readiness.
+
+        Without this the descriptor stays ready and the watch spins.  It
+        has to be read from the beginning: a read that starts where the
+        last one stopped is past the end, returns nothing, and leaves the
+        readiness where it was.  Hence pread rather than a seek and a
+        read, which is the same thing in one call.
+
+        False if it could not be read, which the caller must treat as the
+        watch being finished with.
+        """
+        if self.watch_fd is None:
+            return False
+        try:
+            os.pread(self.watch_fd, 64, 0)
+        except OSError:
+            return False
+        return True
 
     def active(self):
         buf = bytearray(6)

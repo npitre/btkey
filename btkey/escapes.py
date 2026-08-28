@@ -63,16 +63,6 @@ LINUX_FUNCTION = {"A": KEY_F1, "B": KEY_F2, "C": KEY_F3,
 MODIFIER_BITS = (keycodes.MOD_LEFTSHIFT, keycodes.MOD_LEFTALT,
                  keycodes.MOD_LEFTCTRL, keycodes.MOD_LEFTMETA)
 
-# Names for what arrives, so an undecodable sequence can be complained
-# about as something a person recognises.
-KEY_NAMES = {
-    KEY_UP: "Up", KEY_DOWN: "Down", KEY_LEFT: "Left", KEY_RIGHT: "Right",
-    KEY_HOME: "Home", KEY_END: "End", KEY_INSERT: "Insert",
-    KEY_DELETE: "Delete", KEY_PAGEUP: "PageUp", KEY_PAGEDOWN: "PageDown",
-    KEY_TAB: "Tab",
-}
-
-
 def modifiers_from(parameter):
     """Turn xterm's modifier parameter into HID modifier bits."""
     mask = max(0, parameter - 1)

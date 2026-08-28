@@ -90,15 +90,9 @@ KEY_POWER = 116
 class InputDevice:
     def __init__(self, path):
         self.path = path
-        # Read-write so LED reports from the host can be written back as
-        # EV_LED events.  Not every device permits it, and it is not worth
-        # failing over: fall back to reading only.
-        try:
-            self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
-            self.writable = True
-        except OSError:
-            self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-            self.writable = False
+        self.fd = None
+        self.writable = False
+        self._open()
         self.name = self._name()
         self.phys = self._phys()
         # Set when a grab was refused, so that the refusal is reported once
@@ -111,6 +105,20 @@ class InputDevice:
         self.saved_leds = None
         self._buffer = b""
 
+    def _open(self):
+        """Open the node.  Raises OSError if it cannot be opened at all.
+
+        Read-write so LED reports from the host can be written back as
+        EV_LED events.  Not every device permits it, and it is not worth
+        failing over: fall back to reading only.
+        """
+        try:
+            self.fd = os.open(self.path, os.O_RDWR | os.O_NONBLOCK)
+            self.writable = True
+        except OSError:
+            self.fd = os.open(self.path, os.O_RDONLY | os.O_NONBLOCK)
+            self.writable = False
+
     def close(self):
         if self.fd is not None:
             try:
@@ -118,6 +126,22 @@ class InputDevice:
             except OSError:
                 pass
             self.fd = None
+
+    def reopen(self):
+        """Open it again after a spell closed.  False if it is gone.
+
+        What was learned about the device the first time - its name, its
+        keys, whether it has LEDs - is a property of the device and not of
+        the descriptor, so it is kept rather than asked again.
+        """
+        if self.fd is not None:
+            return True
+        try:
+            self._open()
+        except OSError:
+            return False       # _open leaves fd None unless it succeeds
+        self._buffer = b""
+        return True
 
     def _phys(self):
         """Where the device is attached, as the kernel spells it.
@@ -193,6 +217,9 @@ class InputDevice:
         """
         if self.grabbed:
             return True
+        if self.fd is None:
+            self.grab_error = errno.ENODEV
+            return False
         try:
             fcntl.ioctl(self.fd, EVIOCGRAB, 1)
         except OSError as exc:
@@ -204,6 +231,9 @@ class InputDevice:
 
     def ungrab(self):
         if not self.grabbed:
+            return
+        if self.fd is None:
+            self.grabbed = False
             return
         try:
             fcntl.ioctl(self.fd, EVIOCGRAB, 0)
@@ -219,17 +249,23 @@ class InputDevice:
         to the kernel and never to us, so on taking the keyboard back we
         have to ask what is already held rather than assume nothing is.
         """
+        if self.fd is None:
+            return set()
         buf = bytearray(KEY_BYTES)
         try:
             fcntl.ioctl(self.fd, EVIOCGKEY, buf)
         except OSError:
             return set()
-        return {code for code in range(KEY_MAX + 1)
-                if buf[code // 8] & (1 << (code % 8))}
+        # Walking all KEY_MAX+1 codes costs thirty times as much as
+        # skipping the empty bytes, and this runs per device on every
+        # switch back to our console.
+        return {index * 8 + bit
+                for index, byte in enumerate(buf) if byte
+                for bit in range(8) if byte & (1 << bit)}
 
     def leds(self):
         """Current LED state as a bitmask in HID report order."""
-        if not self.has_leds:
+        if not self.has_leds or self.fd is None:
             return 0
         buf = bytearray(LED_BYTES)
         try:
@@ -240,7 +276,7 @@ class InputDevice:
 
     def set_leds(self, mask):
         """Drive the physical LEDs from a HID keyboard LED report."""
-        if not (self.has_leds and self.writable):
+        if not (self.has_leds and self.writable) or self.fd is None:
             return False
         events = b"".join(
             struct.pack(EVENT_FORMAT, 0, 0, EV_LED, code,
@@ -259,6 +295,8 @@ class InputDevice:
         Autorepeat and non-key events are dropped.  Returns None if the
         device has gone away, so the caller can forget it.
         """
+        if self.fd is None:
+            return []
         try:
             data = os.read(self.fd, EVENT_SIZE * 64)
         except OSError as exc:
@@ -334,6 +372,7 @@ class KeyboardSet:
         self.debug = on_debug or (lambda message: None)
         self.devices = {}
         self.grabbed = False
+        self.asleep = False
         self.empty_handed = False
 
     def refresh(self):
@@ -346,7 +385,11 @@ class KeyboardSet:
                 device.close()
                 continue
             self.devices[path] = device
-            if self.grabbed:
+            if self.asleep:
+                # Discovery opens what it finds, and a set that has given
+                # its descriptors up wants this one closed as well.
+                device.close()
+            elif self.grabbed:
                 # Snapshot before grabbing, as grab_all does, or this one
                 # keeps the phone's lock state when the grab is released.
                 device.saved_leds = device.leds()
@@ -407,6 +450,23 @@ class KeyboardSet:
             self.empty_handed = False
             self.event("a keyboard came free; typing reaches the phone again")
 
+    def close_all(self):
+        """Give the descriptors up while another console has the screen.
+
+        An ungrabbed device is still an open device: it delivers
+        everything typed on it, so leaving it open means waking for every
+        keystroke meant for somebody else.
+        """
+        self.asleep = True
+        for device in self.devices.values():
+            device.close()
+
+    def open_all(self):
+        """Take them back.  Returns the ones that are no longer there."""
+        self.asleep = False
+        return [device for device in self.devices.values()
+                if not device.reopen()]
+
     def held_keys(self):
         """Every key physically down across all keyboards."""
         held = set()
@@ -437,6 +497,5 @@ class KeyboardSet:
 
     def close(self):
         self.ungrab_all()
-        for device in self.devices.values():
-            device.close()
+        self.close_all()
         self.devices = {}

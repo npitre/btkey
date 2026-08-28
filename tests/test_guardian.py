@@ -153,9 +153,15 @@ class WatchdogTest(unittest.TestCase):
             try:
                 keeper = guardian.spawn()
                 keeper.watch_me(1)
-                for _ in range(20):     # 2s of healthy beating
+                # The run has to outlast the watchdog, or a watchdog that
+                # never resets would go unnoticed.  Beat well inside it,
+                # though: the guardian waits in select() with a one second
+                # timeout, so one stall longer than the gap kills the
+                # child, and at ten beats to the second a loaded machine
+                # can produce one.
+                for _ in range(40):     # 2s of it, at 20x the margin
                     keeper.heartbeat()
-                    time.sleep(0.1)
+                    time.sleep(0.05)
                 keeper.dismiss()
             finally:
                 os._exit(7)

@@ -24,8 +24,6 @@ import ctypes
 import os
 import shutil
 import signal
-import socket
-import struct
 import subprocess
 import time
 
@@ -206,49 +204,3 @@ def _systemctl(*args):
     return subprocess.run(["systemctl"] + list(args),
                           stdout=subprocess.DEVNULL,
                           stderr=subprocess.DEVNULL)
-
-
-class ClassOfDevice:
-    """Assert a class of device that bluetoothd would not set by itself.
-
-    The class is part major/minor - which main.conf sets - and part service
-    class bits, which bluetoothd computes from the registered profile UUIDs.
-    Its mapping sends Headset and Handsfree to Audio, and A2DP Sink and
-    Source only to Rendering and Capturing.  So a machine offering A2DP but
-    no headset profile advertises Rendering and Capturing with the Audio bit
-    clear, and a phone looking for somewhere to send its sound passes it by.
-
-    Nothing in the D-Bus API exposes those bits, so this writes the class
-    with the HCI command directly and puts it back if bluetoothd overwrites
-    it, which it does whenever the UUID set changes.
-    """
-
-    OGF_HOST_CONTROL = 0x03
-    OCF_WRITE_CLASS_OF_DEV = 0x24
-    HCI_COMMAND_PKT = 0x01
-    HCI_CHANNEL_RAW = 0
-
-    def __init__(self, index=0, on_event=None):
-        self.index = index
-        self.event = on_event or (lambda message: None)
-
-    def write(self, cod):
-        """Send HCI_Write_Class_of_Device.  Returns True if it went out."""
-        opcode = (self.OGF_HOST_CONTROL << 10) | self.OCF_WRITE_CLASS_OF_DEV
-        packet = struct.pack("<BHB3s", self.HCI_COMMAND_PKT, opcode, 3,
-                             cod.to_bytes(3, "little"))
-        try:
-            sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW,
-                                 socket.BTPROTO_HCI)
-        except OSError as exc:
-            self.event("cannot open an HCI socket: %s" % exc.strerror)
-            return False
-        try:
-            sock.bind((self.index,))
-            sock.send(packet)
-            return True
-        except OSError as exc:
-            self.event("cannot set class of device: %s" % exc.strerror)
-            return False
-        finally:
-            sock.close()

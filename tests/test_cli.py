@@ -19,6 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from btkey import cli, config, probe
 
+from test_keys import source_of
+
 
 class SendCommandTest(unittest.TestCase):
     def setUp(self):
@@ -50,6 +52,54 @@ class SendCommandTest(unittest.TestCase):
         self.assertEqual(os.read(fd, 128),
                          b"learn-layout\nlearn-accents\ncancel\n")
 
+    def said(self, name):
+        """What the caller is told, with the command actually sent."""
+        if getattr(self, "fd", None) is None:
+            self.fd = self.listen()      # one FIFO for however many asks
+        fd = self.fd
+        saved, sys.stderr = sys.stderr, io.StringIO()
+        try:
+            cli.send_command(self.path, name)
+            return sys.stderr.getvalue()
+        finally:
+            sys.stderr = saved
+            os.read(fd, 128)
+
+    def test_stopping_promises_no_bell(self):
+        """There is not one, and nothing to wait for either.
+
+        quit() announces and ends the loop; the bell belongs to the
+        probes, which type for minutes and ring at the end.
+        """
+        said = self.said("quit")
+        self.assertIn("stopping", said)
+        self.assertNotIn("bell", said)
+
+    def test_cancelling_promises_no_bell(self):
+        # Done by the time the message is printed.
+        self.assertNotIn("bell", self.said("cancel"))
+
+    def test_a_probe_says_to_wait_for_the_bell(self):
+        said = self.said("learn_layout")
+        self.assertIn("layout probe", said)
+        self.assertIn("bell", said)
+
+    def test_every_command_says_what_it_asked_for(self):
+        for name, (_, description, _) in cli.COMMANDS.items():
+            self.assertIn(description, self.said(name))
+
+    def test_only_what_rings_says_it_rings(self):
+        """The claim has to match the code that would make the sound.
+
+        A command that says "bell" without reaching finish_sweep is
+        exactly the message that sent someone listening for a sound that
+        was never coming.
+        """
+        self.assertIn("self.display.bell()", source_of("sweep.py"))
+        ringing = {name for name, (_, _, waits) in cli.COMMANDS.items()
+                   if waits}
+        self.assertEqual(ringing, {"learn_layout", "learn_accents"})
+
     def test_no_reader_means_btkey_is_not_running(self):
         """Opening a FIFO for writing with no reader gives ENXIO, which is
         a reliable way to notice - better than writing into the void."""
@@ -73,10 +123,8 @@ class SendCommandTest(unittest.TestCase):
         one side to be renamed without the other, which nothing else would
         catch until a command silently did nothing.
         """
-        source = open(os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "btkey", "session.py"), encoding="utf-8").read()
-        for command, _ in cli.COMMANDS.values():
+        source = source_of("session.py")
+        for command, _, _ in cli.COMMANDS.values():
             # Loose on how it is matched - one command carries an argument,
             # so it is dispatched with startswith - but strict on the word.
             self.assertTrue('"%s"' % command in source,

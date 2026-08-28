@@ -15,14 +15,21 @@ is another machine or the power button.
 import errno
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from btkey import evdev
 
-import test_keys
 from test_keys import make_session
+
+
+# The session hands a device's descriptor to GLib, which insists on a real
+# one.  A single pipe stands in for all of them: nothing is ever written to
+# it, so a watch on it never fires, which is what a device that delivers
+# through the test rather than through the kernel wants.
+QUIET_PIPE = os.pipe()
 
 
 class RecordingDevice:
@@ -34,6 +41,7 @@ class RecordingDevice:
 
     def __init__(self, path, trace=None, grabbable=True, leds=0x02):
         self.path = path
+        self.fd = QUIET_PIPE[0]
         self.name = "recording %s" % path
         self.saved_leds = None
         self.grabbable = grabbable
@@ -41,6 +49,7 @@ class RecordingDevice:
         self.refused = False
         self.grab_error = None
         self.closed = False
+        self.gone = False        # unplugged while we were away
         self.held = set()
         self.led_writes = []
         self._leds = leds
@@ -75,9 +84,22 @@ class RecordingDevice:
     def pressed_keys(self):
         return set(self.held)
 
+    def read_keys(self):
+        # Nothing writes to QUIET_PIPE, so no watch on it should ever
+        # fire; if one did, the missing method would raise inside a GLib
+        # callback on a descriptor that stays ready, which is a spin.
+        return []
+
     def close(self):
         self.trace.append("close %s" % self.path)
         self.closed = True
+
+    def reopen(self):
+        self.trace.append("reopen %s" % self.path)
+        if self.gone:
+            return False
+        self.closed = False
+        return True
 
 
 # Held from before make_session() puts a factory in its place, so that the
@@ -101,6 +123,113 @@ def keyboard_factory(*devices):
         keyboards.refresh = lambda: ([], [])
         return keyboards
     return factory
+
+
+class RealDeviceLifecycleTest(unittest.TestCase):
+    """Opening, closing and opening again, on a real InputDevice.
+
+    Everything else here drives recording devices.  These use the real
+    class over an ordinary file: every ioctl it makes fails on one, and
+    every one of them is written to survive that, so what is left is the
+    descriptor handling, which is the part that matters here.
+    """
+
+    def device(self):
+        handle, path = tempfile.mkstemp(prefix="btkey-device-")
+        os.close(handle)
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        return evdev.InputDevice(path), path
+
+    def test_closing_gives_the_descriptor_up(self):
+        device, _ = self.device()
+        device.close()
+        self.assertIsNone(device.fd)
+
+    def test_closing_twice_is_not_an_error(self):
+        device, _ = self.device()
+        device.close()
+        device.close()
+        self.assertIsNone(device.fd)
+
+    def test_reopening_gives_a_working_descriptor_back(self):
+        device, _ = self.device()
+        device.close()
+        self.assertTrue(device.reopen())
+        self.assertIsNotNone(device.fd)
+        os.fstat(device.fd)                 # raises if it is not a real one
+
+    def test_reopening_one_that_went_away_says_so(self):
+        """Unplugged while another console had the screen.
+
+        Reported rather than raised, so the session can forget it and
+        carry on with the keyboards that are still there.
+        """
+        device, path = self.device()
+        device.close()
+        os.unlink(path)
+        self.assertFalse(device.reopen())
+        self.assertIsNone(device.fd)
+
+    def test_reopening_an_open_one_leaves_it_alone(self):
+        # Coming back to the foreground reopens everything it has, and
+        # what was hotplugged while away is already open.
+        device, _ = self.device()
+        before = device.fd
+        self.assertTrue(device.reopen())
+        self.assertEqual(device.fd, before)
+
+    def test_what_it_learned_survives_the_round_trip(self):
+        # Its name and keys belong to the device, not to the descriptor.
+        device, _ = self.device()
+        name, keybits = device.name, device.keybits
+        device.close()
+        device.reopen()
+        self.assertEqual((device.name, device.keybits), (name, keybits))
+
+
+class ClosedDeviceTest(unittest.TestCase):
+    """What the rest of btkey may do to a device that is asleep.
+
+    The phone can send an LED report at any moment, including while
+    another console has the screen and the descriptors are gone.  Every
+    one of these goes through fcntl.ioctl or os.write, which raise
+    TypeError rather than OSError on a closed device, so none of them is
+    covered by the try/except that is already there.
+    """
+
+    def device(self):
+        device = evdev.InputDevice.__new__(evdev.InputDevice)
+        device.fd = None
+        device.has_leds = True
+        device.writable = True
+        device.grabbed = False
+        device.grab_error = None
+        device._buffer = b""
+        return device
+
+    def test_reading_its_leds_says_nothing_is_lit(self):
+        self.assertEqual(self.device().leds(), 0)
+
+    def test_driving_its_leds_reports_failure(self):
+        self.assertFalse(self.device().set_leds(0x02))
+
+    def test_asking_what_is_held_says_nothing(self):
+        self.assertEqual(self.device().pressed_keys(), set())
+
+    def test_reading_it_yields_nothing_rather_than_going_away(self):
+        # None would have the session forget a device that is only asleep.
+        self.assertEqual(self.device().read_keys(), [])
+
+    def test_grabbing_it_fails_as_a_device_that_is_not_there(self):
+        device = self.device()
+        self.assertFalse(device.grab())
+        self.assertEqual(device.grab_error, errno.ENODEV)
+
+    def test_ungrabbing_it_is_not_an_error(self):
+        device = self.device()
+        device.grabbed = True
+        device.ungrab()
+        self.assertFalse(device.grabbed)
 
 
 class RealGrabTest(unittest.TestCase):
@@ -346,6 +475,60 @@ class KeyboardSetTest(unittest.TestCase):
         self.assertEqual(noted, [])
         self.assertEqual(chatter, [])
 
+    def test_closing_them_all_gives_every_descriptor_up(self):
+        one, two = RecordingDevice("/a"), RecordingDevice("/b")
+        keyboards = make_set(one, two)
+        keyboards.close_all()
+        self.assertTrue(one.closed and two.closed)
+
+    def test_a_sleeping_set_closes_what_discovery_opens(self):
+        """Discovery opens what it finds; a sleeping set wants none of it.
+
+        An open device delivers everything typed on it, so one plugged in
+        while another console has the screen would wake btkey for every
+        keystroke meant for somebody else.  refresh() honours the set's
+        posture here exactly as it honours the grab beside it.
+        """
+        arrival = RecordingDevice("/new")
+        keyboards = make_set()
+        keyboards.close_all()
+        self.discovering(arrival)
+        added, _ = keyboards.refresh()
+        self.assertEqual(added, [arrival])
+        self.assertTrue(arrival.closed)
+
+    def test_a_waking_set_leaves_what_discovery_opens_open(self):
+        arrival = RecordingDevice("/new")
+        keyboards = make_set()
+        self.discovering(arrival)
+        keyboards.refresh()
+        self.assertFalse(arrival.closed)
+
+    def test_a_set_that_woke_up_leaves_it_open_too(self):
+        # The posture has to be put back on the way in, or every keyboard
+        # plugged in for the rest of the run is closed on discovery.
+        arrival = RecordingDevice("/new")
+        keyboards = make_set()
+        keyboards.close_all()
+        keyboards.open_all()
+        self.discovering(arrival)
+        keyboards.refresh()
+        self.assertFalse(arrival.closed)
+
+    def discovering(self, *devices):
+        """Put known devices in discovery's way, for refresh() to find."""
+        saved = evdev.discover
+        evdev.discover = lambda extra_paths=(): list(devices)
+        self.addCleanup(setattr, evdev, "discover", saved)
+
+    def test_opening_them_again_reports_the_ones_that_went(self):
+        here, gone = RecordingDevice("/a"), RecordingDevice("/b")
+        gone.gone = True
+        keyboards = make_set(here, gone)
+        keyboards.close_all()
+        self.assertEqual(keyboards.open_all(), [gone])
+        self.assertFalse(here.closed)
+
     def test_restore_leds_keeps_the_grab(self):
         # Between the console's state and the phone's, without giving the
         # keyboard back in between.
@@ -446,13 +629,80 @@ class SessionGrabTest(unittest.TestCase):
         self.assertEqual(len(logged), 1, logged)
         self.assertIn("no keyboard", logged[0])
 
+    def test_leaving_the_foreground_gives_the_descriptors_up(self):
+        """Ungrabbed is not the same as closed.
+
+        An open device delivers everything typed on it whether or not it
+        is grabbed, so a btkey sitting on another console wakes for every
+        keystroke meant for somebody else and drops it on the floor.
+        """
+        device = RecordingDevice("/a")
+        session = self.session(device)
+        session.foreground = False
+        session.set_foreground(True)
+        self.assertEqual(list(session.watches), ["/a"])
+        session.set_foreground(False)
+        self.assertTrue(device.closed)
+        self.assertEqual(session.watches, {})
+
+    def test_coming_back_opens_them_again_and_watches_them(self):
+        device = RecordingDevice("/a")
+        session = self.session(device)
+        session.foreground = False
+        session.set_foreground(True)
+        session.set_foreground(False)
+        session.set_foreground(True)
+        self.assertFalse(device.closed)
+        self.assertEqual(list(session.watches), ["/a"])
+
+    def test_the_leds_go_back_before_the_descriptor_does(self):
+        # Handing the console its lock state back needs the device open.
+        trace = []
+        device = RecordingDevice("/a", trace=trace, leds=0x04)
+        session = self.session(device)
+        session.foreground = False
+        session.set_foreground(True)
+        session.set_foreground(False)
+        self.assertLess(trace.index("leds /a=0x04"), trace.index("close /a"))
+
+    def test_one_unplugged_while_we_were_away_is_dropped(self):
+        device = RecordingDevice("/a")
+        session = self.session(device)
+        session.foreground = False
+        session.set_foreground(True)
+        session.set_foreground(False)
+        device.gone = True
+        session.set_foreground(True)
+        self.assertEqual(session.keyboards.devices, {})
+        self.assertEqual(session.watches, {})
+
+    def test_watching_one_twice_keeps_one_watch(self):
+        # Startup watches what discovery found, and going to the
+        # foreground watches everything it has; the second must not leave
+        # a source behind that nothing will ever remove.
+        device = RecordingDevice("/a")
+        session = self.session(device)
+        session.watch_device(device)
+        first = session.watches["/a"]
+        session.watch_device(device)
+        self.assertEqual(session.watches["/a"], first)
+
     def test_a_hotplugged_keyboard_is_grabbed_and_snapshotted(self):
+        """What a rescan does to a keyboard that arrives mid-session.
+
+        Written the other way round this grabbed the device and set its
+        saved LEDs by hand, then asserted that those had happened; the
+        only production code it reached was the restore.
+        """
         device = RecordingDevice("/a", leds=0x04)
         keyboards = make_set()
         keyboards.grab_all()
         keyboards.devices["/a"] = device
-        device.saved_leds = device.leds()
-        self.assertTrue(device.grab())
+
+        keyboards.grab_all()             # what the rescan runs afterwards
+        self.assertTrue(device.grabbed)
+        self.assertEqual(device.saved_leds, 0x04)
+
         keyboards.ungrab_all()
         self.assertEqual(device.led_writes, [0x04])
 

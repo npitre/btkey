@@ -108,10 +108,17 @@ to.  Everything else is in place at that point, the class of device and
 WirePlumber's A2DP Sink endpoints both, and the audio simply does not
 arrive with nothing anywhere saying why.
 
-So with `--audio=on`, a few seconds after the keyboard connects, btkey
-asks the phone to connect its A2DP Source profile as well and logs what
-came back.  A few seconds because asking in the same breath is refused as
-busy, and a refusal costs nothing but the audio.
+So with `--audio=on`, a second after the keyboard connects, btkey asks
+the phone to connect its A2DP Source profile as well and logs what came
+back.  Not in the same breath, because a phone still bringing up the
+keyboard answers that it is busy.
+
+That answer is a request to come back rather than a refusal, so btkey
+asks again, doubling the wait each time: at one second, three, seven and
+fifteen, until the phone either takes it or says something that is an
+actual answer.  A phone that does not offer A2DP at all says so
+differently and is left alone.  Nothing here can cost more than the
+audio.
 
 ## Keyboards
 
@@ -199,6 +206,79 @@ The exception is no keyboard coming at all, which is said plainly.  btkey
 with nothing to read looks exactly like a phone that has stopped
 listening, and those are chased in entirely different places.
 
+### Noticing the console change
+
+Keystrokes go to the phone exactly while btkey's console is in front, so
+btkey has to know when that stops being true, and quickly: until it does
+it still holds the keyboard the other console is being typed at.
+
+The VT layer notifies on `/sys/class/tty/tty0/active`, which names the
+console in front, so the question is waited on with `POLLPRI` instead of
+asked.  Asking is what btkey used to do, 25 times a second for as long as
+it ran.  A kernel without the attribute falls back to that.
+
+The attribute has to be read once before it is watched, and again after
+every wakeup: an unread sysfs attribute is ready from the outset, so a
+watch that never reads it fires immediately and forever.  The read is a
+`pread` from offset zero, because what clears the readiness is a read
+that starts at the beginning; one carrying on from where the last one
+stopped is past the end and returns nothing.
+
+Its presence is all that is checked.  Waiting on it has worked for as
+long as it has existed, and a probe would prove nothing anyway: an unread
+sysfs attribute reports itself ready whether or not anything notifies on
+it, so one would pass on a kernel that never says a word.
+
+The way this can fail is a descriptor that goes into error, which
+is then reported ready for ever: a callback that says "carry on" turns
+the watch into a busy loop.  The ordinary notification is `POLLPRI` and
+`POLLERR` together, so only an error *without* the event, or a read that
+fails, counts as one, and either ends the watch in favour of asking.
+That one is BRLTTY's lesson from monitoring `/dev/vcsa`.
+
+Leaving the foreground also closes the keyboards rather than merely
+letting go of them.  Ungrabbing is not enough to go quiet: an open device
+delivers everything typed on it either way, so btkey would wake for every
+keystroke meant for the console that actually has the screen, only to
+throw it away.  They are opened again, and anything that was unplugged
+meanwhile is dropped, on the way back.
+
+Only the ones that came are kept.  A keyboard btkey holds no grab on is
+either somebody else's, and then it delivers nothing at all, or nobody's,
+and then its keys reach the console too and arrive here a second time as
+text; either way the descriptor buys nothing.  It is opened and tried
+again on the next switch back, so one that comes free is not lost.
+
+The watch on `/dev/input` follows the foreground as well: what is plugged
+in while another console has the screen is that console's business, and
+the set is looked at afresh on the way back regardless.
+
+The order matters in both directions.  The watch goes on *before* the
+directory is looked at, because a keyboard plugged in between the two
+would fall through the gap: too late for the look, too early for a watch
+that did not exist yet, and unnoticed until the next switch.  It comes
+off *before* the keyboards are given back, for the same reason the other
+way round: an arrival reported after we have let go would have btkey open
+and grab a device on a console that is no longer its own.
+
+So does the watchdog.  The guardian exists to SIGKILL a btkey whose main
+loop has stopped turning, because the kernel then releases the keyboard
+grabs; with no grabs held there is nothing to release, and a wedged
+background btkey is a process doing nothing rather than a machine that
+cannot be typed at.  It is told to stand down on the way out and armed
+again on the way in, which also means the process makes no periodic
+noise at all while it is not the one being typed at.
+
+The beat is five seconds against a ten second deadline.  A beat is not
+something that goes missing: the timer fires unless the main loop has
+stopped turning, and the only call that blocks inside the running loop is
+the send to the phone, which blocks while holding the keyboard.  So the
+deadline has to cover scheduling jitter and nothing more.  Everything
+else that can take its time - waiting for bluetoothd, restarting a unit,
+putting the adapter back - happens either before the watchdog is armed or
+after it has been stood down, which the teardown does first for that
+reason.
+
 ### Noticing a keyboard arriving
 
 A keyboard plugged in while btkey is running is picked up without it,
@@ -207,6 +287,16 @@ so often.  The short wait before looking matters as much as the watch: the
 node appears before udev has given it its ownership and mode, so a look
 the instant it is created finds something btkey is not allowed to open,
 and one keyboard arrives as a burst of several nodes.
+
+The wait is a second, which is longer than either of those needs, because
+it is also whatever else wants this keyboard getting first refusal.  A
+program that grabs it for its own hotkeys publishes the keys it does not
+want through uinput, and that loopback is the device btkey should be
+holding rather than the keyboard itself; BRLTTY does exactly this.
+Looking too soon means taking the real keyboard out from under it, or
+finding the loopback not yet created and missing it until the next
+console switch.  Each arrival restarts the wait, so the loopback
+appearing is itself what ends it.
 
 A keyboard that arrives while another console has the screen is left alone
 until the switch back, which is also when the set is looked at afresh:

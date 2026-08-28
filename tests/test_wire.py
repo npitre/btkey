@@ -179,5 +179,152 @@ class WireTest(unittest.TestCase):
         self.assertEqual(self.socket.sent, [])
 
 
+
+class ChannelReadTest(unittest.TestCase):
+    """Both HIDP channels are read and torn down the same way.
+
+    They used to be two copies of the same nineteen lines, which is the
+    shape where an error path gets fixed on one and not the other and
+    half a link is left standing.
+    """
+
+    def link(self, kind, data=b"", error=None):
+        recorded = []
+
+        class Socket:
+            def recv(self, size):
+                if error is not None:
+                    raise error
+                return data
+
+        link = object.__new__(btlink.BluetoothHID)
+        link.control = link.interrupt = None
+        setattr(link, kind, Socket())
+        link.disconnect = lambda reason="": recorded.append(reason)
+        return link, recorded
+
+    def test_data_comes_back(self):
+        for kind in ("control", "interrupt"):
+            link, gone = self.link(kind, b"hello")
+            self.assertEqual(link._read_channel(kind, 0), b"hello")
+            self.assertEqual(gone, [])
+
+    def test_an_empty_read_is_the_channel_closing(self):
+        for kind in ("control", "interrupt"):
+            link, gone = self.link(kind, b"")
+            self.assertIsNone(link._read_channel(kind, 0))
+            self.assertEqual(gone, ["%s channel closed" % kind])
+
+    def test_hangup_is_the_channel_closing(self):
+        for kind in ("control", "interrupt"):
+            link, gone = self.link(kind, b"hello")
+            self.assertIsNone(
+                link._read_channel(kind, btlink.GLib.IOCondition.HUP))
+            self.assertEqual(gone, ["%s channel closed" % kind])
+
+    def test_an_error_is_reported_as_one(self):
+        for kind in ("control", "interrupt"):
+            link, gone = self.link(kind, error=OSError("nope"))
+            self.assertIsNone(link._read_channel(kind, 0))
+            self.assertEqual(gone, ["%s channel error" % kind])
+
+    def test_a_channel_already_gone_says_nothing_further(self):
+        link, gone = self.link("control", b"hello")
+        link.control = None
+        self.assertIsNone(link._read_channel("control", 0))
+        self.assertEqual(gone, [])
+
+
+class ConnectAudioTest(unittest.TestCase):
+    """Asking the phone for its audio channel, and reading the answer.
+
+    A phone in the middle of bringing up the keyboard says it is busy,
+    which is a request to come back rather than a refusal.  Telling the
+    two apart is what makes asking again worth doing: retrying a phone
+    that simply does not offer A2DP would be noise for ever.
+    """
+
+    def link(self, error=None, message=""):
+        asked = []
+
+        class Device:
+            def ConnectProfile(self, uuid):
+                asked.append(uuid)
+                if error is None:
+                    return
+                exc = btlink.dbus.DBusException(message)
+                exc.get_dbus_name = lambda: error
+                exc.get_dbus_message = lambda: message
+                raise exc
+
+        link = object.__new__(btlink.BluetoothHID)
+        link._device = lambda addr, interface: Device()
+        return link, asked
+
+    def test_a_connection_says_so(self):
+        link, asked = self.link()
+        message, again = link.connect_audio("AA:BB:CC:DD:EE:FF")
+        self.assertIn("connected", message)
+        self.assertFalse(again)
+        self.assertEqual(asked, [btlink.BluetoothHID.A2DP_SOURCE_UUID])
+
+    def test_busy_is_worth_asking_again(self):
+        """Named here rather than read out of BUSY_ERRORS.
+
+        A test that loops over the list it is checking passes however
+        short the list gets, which is the one way this can go wrong.
+        InProgress is what a phone mid-connection answers; Busy is what
+        BlueZ answers while a controller operation is in flight, which
+        _set_adapter already rides out for the same reason.
+        """
+        for name in ("org.bluez.Error.InProgress", "org.bluez.Error.Busy"):
+            link, _ = self.link(name, "busy right now")
+            message, again = link.connect_audio("AA:BB:CC:DD:EE:FF")
+            self.assertTrue(again, name)
+            self.assertIn("busy right now", message)
+
+    def test_a_phone_that_does_not_do_audio_is_not_pestered(self):
+        link, _ = self.link("org.bluez.Error.NotAvailable",
+                            "profile unavailable")
+        _, again = link.connect_audio("AA:BB:CC:DD:EE:FF")
+        self.assertFalse(again)
+
+    def test_neither_is_a_plain_failure(self):
+        link, _ = self.link("org.bluez.Error.Failed", "no")
+        _, again = link.connect_audio("AA:BB:CC:DD:EE:FF")
+        self.assertFalse(again)
+
+    def test_a_refusal_with_no_detail_still_names_the_error(self):
+        link, _ = self.link("org.bluez.Error.Failed", "")
+        message, _ = link.connect_audio("AA:BB:CC:DD:EE:FF")
+        self.assertIn("org.bluez.Error.Failed", message)
+
+
+class AudioProfileTest(unittest.TestCase):
+    """Naming the audio profiles the adapter advertises."""
+
+    def link(self, *uuids):
+        link = object.__new__(btlink.BluetoothHID)
+        link.all_uuids = lambda: list(uuids)
+        return link
+
+    def test_the_audio_ones_are_named(self):
+        self.assertEqual(
+            self.link("0000110b-0000-1000-8000-00805f9b34fb",
+                      "0000110a-0000-1000-8000-00805f9b34fb").audio_profiles(),
+            ["A2DP Sink", "A2DP Source"])
+
+    def test_everything_else_is_left_out(self):
+        # The adapter advertises a dozen; only the audio ones answer the
+        # question "can sound go here".
+        self.assertEqual(
+            self.link("00001124-0000-1000-8000-00805f9b34fb",   # HID
+                      "00001200-0000-1000-8000-00805f9b34fb"    # PnP
+                      ).audio_profiles(), [])
+
+    def test_no_uuids_at_all_is_no_profiles(self):
+        self.assertEqual(self.link().audio_profiles(), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2 if "-v" in sys.argv else 1)

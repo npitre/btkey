@@ -8,6 +8,7 @@ navigation, so that has an explicit test.
 """
 
 import argparse
+import ast
 import io
 import os
 import shutil
@@ -18,6 +19,8 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from btkey import btlink, evdev, kbmap, keycodes, probe, vt
+from btkey import session as session_module
+from btkey import typist as typist_module
 from btkey.typist import INTERVAL_MS as TYPE_INTERVAL_MS
 
 KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G = 30, 48, 46, 32, 18, 33, 34
@@ -31,9 +34,16 @@ class FakeConsoles:
     def __init__(self):
         self.vt = 4
         self.switched = []
+        self.watch_fd = None       # set to a descriptor to be watchable
+        self.rearmed = 0
 
     def is_foreground(self): return True
     def close(self): pass
+    def watch(self): return self.watch_fd
+
+    def rearm(self):
+        self.rearmed += 1
+        return True
 
     def switch_to(self, target):
         self.switched.append(target)
@@ -81,12 +91,16 @@ class FakeKeyboards:
         self.leds = None
         self.restored = 0
         self.grabbed = False
+        self.opened = True
+        self.asleep = False
 
     def held_keys(self): return set(self.held)
     def grab_all(self): self.grabbed = True
     def ungrab_all(self): self.grabbed = False
     def refresh(self): return [], []
     def close(self): pass
+    def close_all(self): self.opened = False; self.asleep = True
+    def open_all(self): self.opened = True; self.asleep = False; return []
 
     def forget(self, device):
         self.devices.pop(device.path, None)
@@ -134,7 +148,50 @@ class FakeLink:
     def stop(self): pass
 
 
-def make_session(keyboards=FakeKeyboards, **overrides):
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def source_of(module):
+    """The text of one btkey module, for the tests that read the code."""
+    with open(os.path.join(ROOT, "btkey", module), encoding="utf-8") as handle:
+        return handle.read()
+
+
+def calls_in(module, function):
+    """Every call in one function, as source text.
+
+    Used to check that a mechanism is wired into startup at all, which
+    is a kind of mistake no amount of testing the mechanism itself will
+    catch.
+    """
+    tree = ast.parse(source_of(module))
+    wanted = next(node for node in ast.walk(tree)
+                  if isinstance(node, ast.FunctionDef)
+                  and node.name == function)
+    return [ast.unparse(node) for node in ast.walk(wanted)
+            if isinstance(node, ast.Call)]
+
+
+def capture_timers(call, scheduler="timeout_add"):
+    """Run something with a GLib scheduler stubbed out.
+
+    Returns a (delay, callback, arguments) triple per timer armed.  The
+    scheduler is named because the two differ in their unit, and a test
+    that watched the wrong one would see nothing and say so.
+    """
+    from btkey import session as session_module
+    timers = []
+    real = getattr(session_module.GLib, scheduler)
+    setattr(session_module.GLib, scheduler,
+            lambda delay, fn, *args: timers.append((delay, fn, args)) or 1)
+    try:
+        call()
+    finally:
+        setattr(session_module.GLib, scheduler, real)
+    return timers
+
+
+def make_session(keyboards=FakeKeyboards, keeper=None, **overrides):
     """Build a Session on fakes.
 
     A Session reaches for its keyboards and its link through the module
@@ -160,7 +217,7 @@ def make_session(keyboards=FakeKeyboards, **overrides):
     vt.Consoles, btlink.BluetoothHID, evdev.KeyboardSet = (
         FakeConsoles, FakeLink, keyboards)
     try:
-        session = Session(options, FakeConsoles(), None)
+        session = Session(options, FakeConsoles(), keeper)
     finally:
         vt.Consoles, btlink.BluetoothHID, evdev.KeyboardSet = saved
     session.foreground = True
@@ -325,6 +382,42 @@ class TeardownTest(unittest.TestCase):
             btlink.ProfileNotAvailable("nope"))
         self.assertEqual(self.session.run(), 1)
         self.assertEqual(self.stopped, ["btd"])
+
+
+class UnsendableKeyTest(unittest.TestCase):
+    """Naming a key btkey decoded but has no HID usage for.
+
+    A key that never arrives at the phone looks exactly like a key that
+    was never pressed, so the one line saying which it was has to name
+    something a person can act on.  Every key keycodes.NAMES names is one
+    btkey can send, so this path only ever sees the unnamed ones, and it
+    used to report every one of them as "?".
+    """
+
+    def unsendable(self, keycode):
+        session = make_session()
+        logged = []
+        session.typist.log = logged.append
+        session.link.connected = True
+        # Stand in for the escape decoder, so the test does not depend on
+        # which sequence a terminal spells this key with.
+        self.addCleanup(setattr, typist_module.escapes, "decode",
+                        typist_module.escapes.decode)
+        typist_module.escapes.decode = (
+            lambda text: ([("steps", ((keycode, 0),))], ""))
+        session.typist.type_text("x")
+        return " ".join(logged)
+
+    def test_it_is_reported_by_number_rather_than_a_question_mark(self):
+        said = self.unsendable(700)
+        self.assertIn("nothing to send for", said)
+        self.assertIn("700", said)
+        self.assertNotIn("?", said)
+
+    def test_a_key_that_can_be_sent_is_not_complained_about(self):
+        # 102 is Home, which keycodes.KEYBOARD has, so it goes to the
+        # phone and nothing is said about it.
+        self.assertEqual(self.unsendable(102), "")
 
 
 class TypingTest(unittest.TestCase):
@@ -743,7 +836,7 @@ class SweepTest(unittest.TestCase):
 
     def test_nothing_is_typed_while_disconnected(self):
         self.session.link.connected = False
-        self.session.learn_layout()
+        self.session.sweep.learn_layout()
         self.assertEqual(len(self.session.typist.queue), 0)
 
     def test_a_probe_is_enqueued_with_its_raw_modifiers(self):
@@ -763,55 +856,92 @@ class SweepProgressTest(unittest.TestCase):
 
     def setUp(self):
         self.session = make_session()
-        self.bells = []
+        self.bells, self.announced = [], []
         self.session.display.bell = lambda: self.bells.append(1)
+        # Handed over when the sweep was built, so replace it there.
+        self.session.sweep.announce = self.announced.append
 
     def batch(self, count=3):
-        self.session.type_batch("test sweep",
+        self.session.sweep.start("test sweep",
                                 [(0, 0x04), (0, 0x2C)] * count)
 
     def test_progress_appears_in_the_indicator(self):
         self.batch()
-        self.session.poll_sweep()
-        self.assertRegex(self.session.display.indicator, r"^\d+%$")
+        self.session.sweep.poll()
+        self.assertRegex(self.session.display.shown_indicator, r"^\d+%$")
 
     def test_it_finishes_when_the_queue_drains(self):
         self.batch()
         while self.session.typist.drain():
             pass
-        self.assertFalse(self.session.poll_sweep())
-        self.assertIsNone(self.session.sweep_name)
+        self.assertFalse(self.session.sweep.poll())
+        self.assertIsNone(self.session.sweep.name)
 
     def test_finishing_rings_the_bell(self):
         self.batch()
         while self.session.typist.drain():
             pass
-        self.session.poll_sweep()
+        self.session.sweep.poll()
         self.assertEqual(len(self.bells), 1)
 
     def test_the_lock_indicator_comes_back_afterwards(self):
-        """The percentage was borrowing the lock indicator's slot."""
-        self.session.leds = 0x02
+        """The percentage borrows the lock indicator's slot and gives it back.
+
+        The sweep does not put the lock state back itself, which would
+        mean knowing what was in the slot; it hands the slot over and the
+        display remembers.
+        """
+        self.session.apply_leds(0x02)
         self.batch()
-        self.session.poll_sweep()
+        self.session.sweep.poll()
         while self.session.typist.drain():
             pass
-        self.session.poll_sweep()
-        self.assertEqual(self.session.display.indicator, "CAPS")
+        self.session.sweep.poll()
+        self.assertEqual(self.session.display.shown_indicator, "CAPS")
+
+    def test_a_lock_key_pressed_mid_sweep_is_not_lost(self):
+        """The standing indicator keeps changing underneath the borrow.
+
+        Caps Lock during a probe still has to be there when the slot is
+        handed back, or the display goes on showing a state the phone
+        left behind a minute ago.
+        """
+        self.batch()
+        self.session.sweep.poll()
+        self.session.apply_leds(0x02)            # Caps, mid-probe
+        self.assertRegex(self.session.display.shown_indicator, r"^\d+%$")
+        while self.session.typist.drain():
+            pass
+        self.session.sweep.poll()
+        self.assertEqual(self.session.display.shown_indicator, "CAPS")
+
+    def test_a_disconnect_mid_sweep_is_not_completion(self):
+        """drain() empties the queue when the phone goes.
+
+        An empty queue is how completion is recognised, so without this
+        a probe cut short reads as done, bell and all, and sends someone
+        off to mail a capture that stops halfway.
+        """
+        self.batch(count=50)
+        self.session.sweep.poll()
+        self.session.link.connected = False
+        self.assertFalse(self.session.sweep.poll())
+        self.assertFalse(self.session.sweep.running)
+        self.assertIn("disconnected", "\n".join(self.announced))
 
     def test_cancel_abandons_the_queue(self):
         self.batch(count=50)
-        self.session.cancel_learning()
+        self.session.sweep.cancel()
         self.assertEqual(len(self.session.typist.queue), 0)
-        self.assertIsNone(self.session.sweep_name)
+        self.assertIsNone(self.session.sweep.name)
         self.assertEqual(len(self.bells), 1)
 
     def test_cancel_with_nothing_running_is_harmless(self):
-        self.session.cancel_learning()
+        self.session.sweep.cancel()
         self.assertEqual(self.bells, [])
 
     def test_polling_with_no_sweep_stops_the_timer(self):
-        self.assertFalse(self.session.poll_sweep())
+        self.assertFalse(self.session.sweep.poll())
 
 
 class LearnAccentsTest(unittest.TestCase):
@@ -824,22 +954,22 @@ class LearnAccentsTest(unittest.TestCase):
     def setUp(self):
         self.session = make_session()
     def test_it_probes_the_keys_it_was_given(self):
-        self.session.learn_accents(["26:0", "26:2"])
-        self.assertEqual(self.session.sweep_name, "learning accent keys")
+        self.session.sweep.learn_accents(["26:0", "26:2"])
+        self.assertEqual(self.session.sweep.name, "learning accent keys")
         self.assertGreater(len(self.session.typist.queue), 0)
 
     def test_no_keys_means_nothing_is_typed(self):
-        self.session.learn_accents([])
-        self.assertIsNone(self.session.sweep_name)
+        self.session.sweep.learn_accents([])
+        self.assertIsNone(self.session.sweep.name)
         self.assertEqual(len(self.session.typist.queue), 0)
 
     def test_a_malformed_key_is_skipped_not_fatal(self):
-        self.session.learn_accents(["26:0", "rubbish", "26:2"])
-        self.assertEqual(self.session.sweep_name, "learning accent keys")
+        self.session.sweep.learn_accents(["26:0", "rubbish", "26:2"])
+        self.assertEqual(self.session.sweep.name, "learning accent keys")
 
     def test_nothing_is_typed_while_disconnected(self):
         self.session.link.connected = False
-        self.session.learn_accents(["26:0"])
+        self.session.sweep.learn_accents(["26:0"])
         self.assertEqual(len(self.session.typist.queue), 0)
 
 
@@ -1450,13 +1580,168 @@ class StartupLineTest(unittest.TestCase):
         self.assertEqual(started_by(), pwd.getpwuid(os.geteuid()).pw_name)
 
 
+class LastHostTest(unittest.TestCase):
+    """The paired host is read from disk once, not per keystroke.
+
+    reconnect() asks for it on every key event while the link is down -
+    that is deliberate, a real keyboard wakes its host - and it asks
+    before its own ten second rate limit has had a chance to say no.  So
+    this was an open, a read and a close per keystroke, answering a
+    question this class is the only thing that ever changes.
+    """
+
+    def link(self, contents=None):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        link = object.__new__(btlink.BluetoothHID)
+        link.STATE_FILE = os.path.join(directory, "host")
+        link._known_host = btlink.BluetoothHID.UNREAD
+        if contents is not None:
+            with open(link.STATE_FILE, "w") as handle:
+                handle.write(contents)
+        return link
+
+    def test_it_reads_what_is_there(self):
+        link = self.link("AA:BB:CC:DD:EE:FF\n")
+        self.assertEqual(link.last_host(), "AA:BB:CC:DD:EE:FF")
+
+    def test_no_file_is_no_host(self):
+        self.assertIsNone(self.link().last_host())
+
+    def test_an_empty_file_is_no_host(self):
+        self.assertIsNone(self.link("\n").last_host())
+
+    def test_the_file_is_read_once(self):
+        link = self.link("AA:BB:CC:DD:EE:FF\n")
+        self.assertEqual(link.last_host(), "AA:BB:CC:DD:EE:FF")
+        os.unlink(link.STATE_FILE)          # the disk no longer agrees
+        self.assertEqual(link.last_host(), "AA:BB:CC:DD:EE:FF")
+
+    def test_having_no_host_is_remembered_too(self):
+        # Otherwise the miss is re-tried on every keystroke, forever,
+        # which is the case with no rate limit in front of it at all.
+        link = self.link()
+        self.assertIsNone(link.last_host())
+        with open(link.STATE_FILE, "w") as handle:
+            handle.write("AA:BB:CC:DD:EE:FF\n")
+        self.assertIsNone(link.last_host())
+
+    def test_pairing_with_someone_updates_it(self):
+        link = self.link()
+        self.assertIsNone(link.last_host())
+        link._remember_host("11:22:33:44:55:66")
+        self.assertEqual(link.last_host(), "11:22:33:44:55:66")
+
+    def test_the_written_file_says_the_same(self):
+        link = self.link()
+        link._remember_host("11:22:33:44:55:66")
+        with open(link.STATE_FILE) as handle:
+            self.assertEqual(handle.read().strip(), "11:22:33:44:55:66")
+
+
+class LinkFailureTest(unittest.TestCase):
+    """A BlueZ refusal reaches the console as a line, not a traceback."""
+
+    def test_a_dbus_failure_is_converted_at_the_boundary(self):
+        link = object.__new__(btlink.BluetoothHID)
+        link._find_adapter = lambda: (_ for _ in ()).throw(
+            btlink.dbus.DBusException("nope"))
+        with self.assertRaises(btlink.LinkError):
+            link.start()
+
+    def test_the_message_says_who_refused_and_why(self):
+        exc = btlink.dbus.DBusException("adapter is busy")
+        exc.get_dbus_name = lambda: "org.bluez.Error.Busy"
+        exc.get_dbus_message = lambda: "adapter is busy"
+        said = btlink.describe(exc)
+        self.assertIn("org.bluez.Error.Busy", said)
+        self.assertIn("adapter is busy", said)
+
+    def test_a_failure_with_no_detail_still_says_who(self):
+        exc = btlink.dbus.DBusException()
+        exc.get_dbus_name = lambda: "org.bluez.Error.Failed"
+        exc.get_dbus_message = lambda: ""
+        self.assertIn("org.bluez.Error.Failed", btlink.describe(exc))
+
+    def test_something_that_is_not_a_dbus_failure_is_left_alone(self):
+        self.assertEqual(btlink.describe(OSError("plain")), "plain")
+
+    def test_the_session_does_not_know_what_dbus_is(self):
+        """The seam this conversion exists to draw.
+
+        btd converts to BluetoothdError and btlink to LinkError, so the
+        loop can report a BlueZ refusal without importing dbus to catch
+        one or to format it.
+        """
+        source = source_of("session.py")
+        self.assertNotIn("import dbus", source)
+        self.assertNotIn("dbus.", source)
+        self.assertIn("btlink.LinkError", source)
+
+
+class ProxyCacheTest(unittest.TestCase):
+    """BlueZ proxies are built once and kept.
+
+    Every dbus.Interface(bus.get_object(...)) costs a GetNameOwner to the
+    bus daemon and an Introspect of the object, both blocking, both on
+    the main loop, before the call anyone wanted is sent.  The 5 second
+    class-of-device backstop was paying all three every time.
+    """
+
+    def link(self):
+        built = []
+
+        class Bus:
+            def get_object(self, name, path):
+                built.append(path)
+                return ("object", path)
+
+        link = object.__new__(btlink.BluetoothHID)
+        link.adapter_path = "/org/bluez/hci0"
+        link.bus = Bus()
+        link._proxies = {}
+        self.addCleanup(setattr, btlink.dbus, "Interface",
+                        btlink.dbus.Interface)
+        btlink.dbus.Interface = lambda obj, iface: (obj, iface)
+        return link, built
+
+    def test_the_adapter_is_looked_up_once(self):
+        link, built = self.link()
+        self.assertIs(link._adapter_props(), link._adapter_props())
+        self.assertEqual(built, ["/org/bluez/hci0"])
+
+    def test_two_interfaces_on_one_path_stay_apart(self):
+        # Same object, different interface: one cache entry each.
+        link, _ = self.link()
+        self.assertIsNot(link._manager(btlink.AGENT_MANAGER_IFACE),
+                         link._manager(btlink.PROFILE_MANAGER_IFACE))
+
+    def test_two_devices_stay_apart(self):
+        link, _ = self.link()
+        self.assertIsNot(link._device("AA:BB:CC:DD:EE:FF",
+                                      btlink.DEVICE_IFACE),
+                         link._device("11:22:33:44:55:66",
+                                      btlink.DEVICE_IFACE))
+
+    def test_one_device_is_looked_up_once(self):
+        link, built = self.link()
+        link._device("AA:BB:CC:DD:EE:FF", btlink.DEVICE_IFACE)
+        link._device("AA:BB:CC:DD:EE:FF", btlink.DEVICE_IFACE)
+        self.assertEqual(built, ["/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF"])
+
+    def test_the_path_is_spelled_the_way_bluez_spells_it(self):
+        link, built = self.link()
+        link._device("AA:BB:CC:DD:EE:FF", btlink.DEVICE_IFACE)
+        self.assertEqual(built, ["/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF"])
+
+
 class HostVendorTest(unittest.TestCase):
     """Reading the company identifier out of the host's Device ID record."""
 
     def link_reporting(self, modalias):
         link = object.__new__(btlink.BluetoothHID)
         link.adapter_path = "/org/bluez/hci0"
-        link.bus = None
+        link._proxies = {}
 
         class Props:
             def Get(self, interface, name):
@@ -1464,16 +1749,14 @@ class HostVendorTest(unittest.TestCase):
                     raise btlink.dbus.DBusException("no such property")
                 return modalias
 
-        saved_interface = btlink.dbus.Interface
-        saved_object = type(link).__dict__.get("bus")
-        btlink.dbus.Interface = lambda obj, iface: Props()
-
         class Bus:
             def get_object(self, name, path):
                 return None
 
         link.bus = Bus()
-        self.addCleanup(setattr, btlink.dbus, "Interface", saved_interface)
+        self.addCleanup(setattr, btlink.dbus, "Interface",
+                        btlink.dbus.Interface)
+        btlink.dbus.Interface = lambda obj, iface: Props()
         return link
 
     def test_apple_is_004c(self):
@@ -1515,9 +1798,12 @@ class AudioOfferTest(unittest.TestCase):
         self.asked = []
         self.session.link.connect_audio = self.answer
 
+    #: Set to a (message, again) pair to answer with something else.
+    reply = ("audio channel connected", False)
+
     def answer(self, peer):
         self.asked.append(peer)
-        return "audio channel connected"
+        return self.reply
 
     def connect(self, peer="AA:BB:CC:DD:EE:FF"):
         self.session.link.peer = peer
@@ -1560,17 +1846,13 @@ class AudioOfferTest(unittest.TestCase):
         on_connection_state returns asserts nothing at all: the timer has
         not fired and never will in a test.
         """
-        planned = []
-        from btkey import session as module
-        saved = module.GLib.timeout_add_seconds
-        module.GLib.timeout_add_seconds = (
-            lambda delay, callback, *args: planned.append((callback, args)))
-        try:
+        def connect():
             session.link.peer = peer
             session.on_connection_state(True, peer)
-        finally:
-            module.GLib.timeout_add_seconds = saved
-        return planned
+
+        return [(callback, arguments)
+                for _, callback, arguments
+                in capture_timers(connect, "timeout_add_seconds")]
 
     def test_connecting_schedules_the_offer(self):
         session = make_session()
@@ -1586,9 +1868,55 @@ class AudioOfferTest(unittest.TestCase):
 
     def test_a_refusal_is_reported_and_survived(self):
         peer = self.connect()
-        self.session.link.connect_audio = lambda p: "no audio channel: busy"
+        self.reply = ("no audio channel: not supported", False)
         self.session.offer_audio(peer)
-        self.assertIn("no audio channel: busy", self.said)
+        self.assertIn("no audio channel: not supported", self.said)
+
+    def test_being_told_busy_is_not_an_answer(self):
+        """It is a request to come back, and used to end the matter.
+
+        A single attempt refused left the machine advertising somewhere
+        to send sound with nothing ever asking for it again, and nothing
+        anywhere saying why.
+        """
+        peer = self.connect()
+        self.reply = ("no audio channel: in progress", True)
+        timers = capture_timers(lambda: self.session.offer_audio(peer),
+                                "timeout_add_seconds")
+        self.assertEqual([delay for delay, _, _ in timers],
+                         [2 * session_module.AUDIO_CONNECT_DELAY])
+
+    def test_asking_again_carries_the_phone_and_the_next_wait(self):
+        peer = self.connect()
+        self.reply = ("no audio channel: in progress", True)
+        timers = capture_timers(lambda: self.session.offer_audio(peer),
+                                "timeout_add_seconds")
+        _, _, arguments = timers[0]
+        self.assertEqual(arguments[0], peer)
+        self.assertEqual(arguments[2],
+                         session_module.AUDIO_RETRIES - 1)   # one fewer left
+
+    def test_it_gives_up_in_the_end(self):
+        peer = self.connect()
+        self.reply = ("no audio channel: in progress", True)
+        timers = capture_timers(
+            lambda: self.session.offer_audio(peer, wait=8, left=0),
+            "timeout_add_seconds")
+        self.assertEqual(timers, [])
+        self.assertIn("no audio channel: in progress", self.said)
+
+    def test_the_waits_double(self):
+        peer = self.connect()
+        self.reply = ("no audio channel: in progress", True)
+        timers = capture_timers(
+            lambda: self.session.offer_audio(peer, wait=4, left=2),
+            "timeout_add_seconds")
+        self.assertEqual([delay for delay, _, _ in timers], [8])
+
+    def test_the_first_ask_comes_soon(self):
+        # Long enough not to be refused out of hand, short enough that
+        # the sound is there before anyone wonders where it is.
+        self.assertLessEqual(session_module.AUDIO_CONNECT_DELAY, 2)
 
 
 class SweepTimingTest(unittest.TestCase):
@@ -1605,14 +1933,16 @@ class SweepTimingTest(unittest.TestCase):
     def setUp(self):
         self.said = []
         self.session = make_session()
-        self.session.log = self.said.append
+        # The sweep was handed the session's log when it was built, so
+        # replacing the session's own would leave it reporting elsewhere.
+        self.session.sweep.log = self.said.append
         self.session.link.connected = True
 
     def sweep(self, steps, reports, waiting):
-        self.session.type_batch("probing", steps)
+        self.session.sweep.start("probing", steps)
         self.session.link.sent_reports += reports
         self.session.link.send_seconds += waiting
-        self.session.finish_sweep("done")
+        self.session.sweep.finish("done")
         return "\n".join(self.said)
 
     def test_it_reports_what_the_probe_cost(self):
@@ -1626,9 +1956,9 @@ class SweepTimingTest(unittest.TestCase):
     def test_it_gives_the_estimate_to_compare_against(self):
         # The number, not the word: without it the measurement has nothing
         # to be measured against.
-        self.session.type_batch("probing", [(0, 0x04)] * 125)
-        queued = self.session.sweep_queued
-        self.session.finish_sweep("done")
+        self.session.sweep.start("probing", [(0, 0x04)] * 125)
+        queued = self.session.sweep.queued
+        self.session.sweep.finish("done")
         expected = queued * TYPE_INTERVAL_MS / 1000.0
         self.assertIn("estimated %.1fs" % expected, "\n".join(self.said))
 
@@ -1643,7 +1973,7 @@ class SweepTimingTest(unittest.TestCase):
         self.assertNotIn("31.0s", said)
 
     def test_finishing_without_starting_says_nothing_misleading(self):
-        self.session.finish_sweep("done")
+        self.session.sweep.finish("done")
         self.assertNotIn("waiting on the link", "\n".join(self.said))
 
 
@@ -1776,9 +2106,9 @@ class ControlCommandTest(unittest.TestCase):
     def setUp(self):
         self.session = make_session()
         self.done = []
-        self.session.learn_layout = lambda: self.done.append("layout")
-        self.session.learn_accents = lambda specs: self.done.append(specs)
-        self.session.cancel_learning = lambda: self.done.append("cancel")
+        self.session.sweep.learn_layout = lambda: self.done.append("layout")
+        self.session.sweep.learn_accents = lambda specs: self.done.append(specs)
+        self.session.sweep.cancel = lambda: self.done.append("cancel")
 
     def feed(self, text):
         read_fd, write_fd = os.pipe()
@@ -1838,6 +2168,150 @@ class ControlCommandTest(unittest.TestCase):
         # O_RDWR means end-of-file never arrives; a watch that removed
         # itself would leave a channel that had logged itself as working.
         self.assertTrue(self.feed("cancel\n"))
+
+
+class BackgroundedTest(unittest.TestCase):
+    """What btkey holds while another console has the screen: nothing.
+
+    The keyboards are given back, the watch for new ones comes off, and
+    the guardian is told to stand down.  Backgrounded, btkey holds no
+    grab, so a wedged one is a process doing nothing rather than a
+    machine that cannot be typed at, and there is nothing for the
+    watchdog's SIGKILL to release.
+    """
+
+    class Keeper:
+        def __init__(self):
+            self.watched = []
+            self.beats = 0
+
+        def watch_me(self, seconds):
+            self.watched.append(seconds)
+
+        def heartbeat(self):
+            self.beats += 1
+
+    def session(self, *devices):
+        from test_grab import RecordingDevice, keyboard_factory
+        self.keeper = self.Keeper()
+        session = make_session(keyboards=keyboard_factory(*devices),
+                               keeper=self.keeper)
+        session.foreground = False
+        self.timers = []
+        real = session_module.GLib.timeout_add
+        self.addCleanup(setattr, session_module.GLib, "timeout_add", real)
+        session_module.GLib.timeout_add = (
+            lambda ms, fn, *a: self.timers.append((ms, fn)) or len(self.timers))
+        removed = self.removed = []
+        real_remove = session_module.GLib.source_remove
+        self.addCleanup(setattr, session_module.GLib, "source_remove",
+                        real_remove)
+        session_module.GLib.source_remove = removed.append
+        return session
+
+    def test_taking_the_screen_arms_the_watchdog(self):
+        session = self.session()
+        session.set_foreground(True)
+        self.assertEqual(self.keeper.watched,
+                         [session_module.WATCHDOG_SECONDS])
+
+    def test_taking_the_screen_starts_beating_at_once(self):
+        # Not one interval later: the guardian starts counting now.
+        session = self.session()
+        session.set_foreground(True)
+        self.assertEqual(self.keeper.beats, 1)
+        self.assertIn(session_module.HEARTBEAT_MS,
+                      [ms for ms, _ in self.timers])
+
+    def test_giving_it_up_stands_the_watchdog_down(self):
+        session = self.session()
+        session.set_foreground(True)
+        session.set_foreground(False)
+        self.assertEqual(self.keeper.watched,
+                         [session_module.WATCHDOG_SECONDS, 0])
+
+    def test_giving_it_up_stops_the_beating(self):
+        session = self.session()
+        session.set_foreground(True)
+        beating = session.heartbeat_timer
+        session.set_foreground(False)
+        self.assertIsNone(session.heartbeat_timer)
+        self.assertIn(beating, self.removed)
+
+    def test_coming_back_arms_it_again(self):
+        session = self.session()
+        session.set_foreground(True)
+        session.set_foreground(False)
+        session.set_foreground(True)
+        self.assertEqual(self.keeper.watched,
+                         [session_module.WATCHDOG_SECONDS, 0,
+                          session_module.WATCHDOG_SECONDS])
+
+    def test_the_deadline_allows_for_scheduling_and_no_more(self):
+        """Two intervals: enough for jitter, not enough to sit out a wedge.
+
+        A beat is not something that goes missing.  The timer fires
+        unless the main loop has stopped turning, and inside the running
+        loop the only call that blocks is the send to the phone, which
+        blocks while holding the keyboard - a machine nobody can type
+        at, which is the case the guardian exists for.  So the deadline
+        only has to survive ordinary scheduling jitter; anything longer
+        is the thing it is meant to catch.
+        """
+        self.assertGreaterEqual(session_module.WATCHDOG_SECONDS * 1000,
+                                session_module.HEARTBEAT_MS * 2)
+
+    def test_no_guardian_is_not_an_error(self):
+        session = make_session()
+        session.foreground = False
+        session.set_foreground(True)
+        session.set_foreground(False)
+        self.assertIsNone(session.heartbeat_timer)
+
+
+class DevicesWeCouldNotTakeTest(unittest.TestCase):
+    """Only the keyboards we hold a grab on are kept open.
+
+    One we hold no grab on is either somebody else's, and delivers us
+    nothing, or nobody's, and then its keys reach the console too and
+    come back to us as text.  Either way the descriptor buys nothing.
+    """
+
+    def session(self, *devices):
+        from test_grab import keyboard_factory
+        session = make_session(keyboards=keyboard_factory(*devices))
+        session.foreground = False
+        return session
+
+    def test_one_that_would_not_come_is_given_back(self):
+        from test_grab import RecordingDevice
+        held = RecordingDevice("/a", grabbable=False)
+        session = self.session(held)
+        session.set_foreground(True)
+        self.assertTrue(held.closed)
+        self.assertNotIn("/a", session.watches)
+
+    def test_one_we_took_is_kept(self):
+        from test_grab import RecordingDevice
+        ours = RecordingDevice("/a")
+        session = self.session(ours)
+        session.set_foreground(True)
+        self.assertFalse(ours.closed)
+        self.assertIn("/a", session.watches)
+
+    def test_it_is_tried_again_on_the_way_back(self):
+        # Whatever held it can let go, so giving the descriptor back must
+        # not mean giving the keyboard up for the rest of the run.
+        from test_grab import RecordingDevice
+        device = RecordingDevice("/a", grabbable=False)
+        session = self.session(device)
+        session.set_foreground(True)
+        session.set_foreground(False)
+        device.grabbable = True
+        session.set_foreground(True)
+        self.assertTrue(device.grabbed)
+        self.assertFalse(device.closed)
+        self.assertIn("/a", session.watches)
 
 
 if __name__ == "__main__":

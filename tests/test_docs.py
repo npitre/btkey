@@ -213,13 +213,21 @@ class LicenceTest(unittest.TestCase):
                           "%s has no licence tag" % os.path.relpath(path, ROOT))
 
     def test_the_tag_comes_after_any_shebang(self):
-        # A tag above #! would stop the file being executable at all.
+        """A tag above #! would stop the file being executable at all.
+
+        Read the other way round - skip the files that have a shebang
+        first - this asked nothing of anything: a file without one
+        trivially has no "#!" on its first line.
+        """
         for path in self.sources():
             with open(path, encoding="utf-8") as handle:
-                first = handle.readline()
-            if first.startswith("#!"):
-                continue
-            self.assertNotIn("#!", first, path)
+                head = handle.readlines()[:4]
+            for number, line in enumerate(head):
+                if line.startswith("#!"):
+                    self.assertEqual(
+                        number, 0,
+                        "%s has its shebang on line %d"
+                        % (os.path.relpath(path, ROOT), number + 1))
 
     def test_the_licence_itself_is_there(self):
         with open(os.path.join(ROOT, "LICENSE"), encoding="utf-8") as handle:

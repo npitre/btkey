@@ -375,5 +375,56 @@ class DiscoverCompanionTest(unittest.TestCase):
         self.assertEqual(sorted(found), ["event0", "event1"])
 
 
+
+class PressedKeysTest(unittest.TestCase):
+    """Which keys are physically down, read out of an EVIOCGKEY bitmap.
+
+    A grab only shows transitions, so on taking a keyboard back btkey has
+    to ask what is already held; get the bit order wrong and it adopts
+    modifiers nobody is pressing, which is how a bare Fn turns into
+    Alt+Fn and goes to the phone instead of switching console.
+    """
+
+    def device_holding(self, *keycodes_):
+        buf = bytearray(evdev.KEY_BYTES)
+        for keycode in keycodes_:
+            buf[keycode // 8] |= 1 << (keycode % 8)
+
+        device = evdev.InputDevice.__new__(evdev.InputDevice)
+        device.fd = 3
+
+        def ioctl(fd, request, into):
+            into[:] = buf
+            return 0
+
+        self.addCleanup(setattr, evdev.fcntl, "ioctl", evdev.fcntl.ioctl)
+        evdev.fcntl.ioctl = ioctl
+        return device
+
+    def test_nothing_held_is_an_empty_set(self):
+        self.assertEqual(self.device_holding().pressed_keys(), set())
+
+    def test_one_key_is_reported_by_its_own_keycode(self):
+        self.assertEqual(self.device_holding(42).pressed_keys(), {42})
+
+    def test_the_bit_order_is_least_significant_first(self):
+        # 0 and 7 share a byte and sit at its two ends; reversing the
+        # order inside the byte swaps them and nothing else would notice.
+        self.assertEqual(self.device_holding(0, 7).pressed_keys(), {0, 7})
+
+    def test_several_across_several_bytes(self):
+        held = {1, 29, 42, 56, 100, 255}
+        self.assertEqual(self.device_holding(*held).pressed_keys(), held)
+
+    def test_the_highest_keycode_is_not_lost(self):
+        self.assertEqual(self.device_holding(evdev.KEY_MAX).pressed_keys(),
+                         {evdev.KEY_MAX})
+
+    def test_a_closed_device_holds_nothing(self):
+        device = self.device_holding(42)
+        device.fd = None
+        self.assertEqual(device.pressed_keys(), set())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2 if "-v" in sys.argv else 1)
