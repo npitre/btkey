@@ -332,7 +332,7 @@ class ListDevicesTest(unittest.TestCase):
         saved_discover = cli.evdev.discover
         saved_device = cli.evdev.InputDevice
         saved_glob = cli.glob.glob
-        cli.evdev.discover = lambda extra=(): list(chosen)
+        cli.evdev.discover = lambda extra=(), known=(): (list(chosen), [])
         cli.evdev.InputDevice = lambda path: rest[path]
         cli.glob.glob = lambda pattern: sorted(
             [d.path for d in chosen] + list(rest))
@@ -344,19 +344,100 @@ class ListDevicesTest(unittest.TestCase):
 
     def test_a_device_btkey_wants_and_can_have(self):
         said = self.listing([self.Device("/dev/input/event0")])
-        self.assertIn("grab", said)
+        self.assertIn("available", said)
 
     def test_a_device_btkey_wants_and_cannot_have(self):
         said = self.listing([self.Device("/dev/input/event0",
                                          error=errno.EBUSY)])
-        self.assertIn("held", said)
-        self.assertNotIn("grab", said)
+        self.assertIn("in use", said)
+        self.assertNotIn("available", said)
+
+    def test_the_program_holding_it_is_named(self):
+        """Which program is the whole of what anyone wants to know.
+
+        "btkey" means the one already running has it and all is well;
+        "brltty" means go and look at its configuration.  Bare "held" is
+        what is left when the holder cannot be named.
+        """
+        self.addCleanup(setattr, cli.evdev, "openers", cli.evdev.openers)
+        cli.evdev.openers = lambda paths, ignore=(): {p: ["brltty"]
+                                                     for p in paths}
+        said = self.listing([self.Device("/dev/input/event0",
+                                         error=errno.EBUSY)])
+        self.assertIn("used by brltty", said)
+
+    def test_a_process_that_holds_a_free_device_is_not_blamed(self):
+        """systemd-logind has every input device open, and grabs none.
+
+        Naming the first process /proc happens to list said "used by
+        systemd-logind" for a keyboard BRLTTY had.  The devices that did
+        come settle it: a process holding one of those open is
+        demonstrably not what stops a grab.
+        """
+        self.addCleanup(setattr, cli.evdev, "openers", cli.evdev.openers)
+        cli.evdev.openers = lambda paths, ignore=(): {
+            "/dev/input/event1": ["systemd-logind", "brltty"],
+            "/dev/input/event4": ["systemd-logind"],
+        }
+        said = self.listing([self.Device("/dev/input/event1",
+                                         error=errno.EBUSY),
+                             self.Device("/dev/input/event4")])
+        self.assertIn("used by brltty", said)
+        self.assertNotIn("systemd-logind", said)
+
+    def test_with_nothing_free_to_compare_against_all_are_named(self):
+        """Which is what a running btkey looks like: it has them all.
+
+        Nothing proves any of them innocent then, so the honest answer
+        names them and lets the reader pick out the one they know.
+        """
+        self.addCleanup(setattr, cli.evdev, "openers", cli.evdev.openers)
+        cli.evdev.openers = lambda paths, ignore=(): {
+            "/dev/input/event1": ["systemd-logind", "btkey"]}
+        said = self.listing([self.Device("/dev/input/event1",
+                                         error=errno.EBUSY)])
+        self.assertIn("used by systemd-logind, btkey", said)
+
+    def test_nothing_is_asked_of_proc_when_everything_came(self):
+        # The walk is not free, and there is nothing to attribute.
+        looked = []
+        self.addCleanup(setattr, cli.evdev, "openers", cli.evdev.openers)
+        cli.evdev.openers = lambda paths, ignore=(): looked.append(1) or {}
+        self.listing([self.Device("/dev/input/event1")])
+        self.assertEqual(looked, [])
+
+    def test_the_running_btkey_is_named_as_such(self):
+        # The answer somebody most often wants: it is already working.
+        self.addCleanup(setattr, cli.evdev, "openers", cli.evdev.openers)
+        cli.evdev.openers = lambda paths, ignore=(): {p: ["btkey"]
+                                                     for p in paths}
+        said = self.listing([self.Device("/dev/input/event0",
+                                         error=errno.EBUSY)])
+        self.assertIn("used by btkey", said)
+
+    def test_a_holder_that_cannot_be_named_is_still_held(self):
+        self.addCleanup(setattr, cli.evdev, "openers", cli.evdev.openers)
+        cli.evdev.openers = lambda paths, ignore=(): {p: [] for p in paths}
+        said = self.listing([self.Device("/dev/input/event0",
+                                         error=errno.EBUSY)])
+        self.assertIn("in use", said)
+        self.assertNotIn("used by", said)
+
+    def test_a_refusal_that_is_not_busy_is_not_blamed_on_anyone(self):
+        # ENODEV is the device having gone, not somebody holding it.
+        looked = []
+        self.addCleanup(setattr, cli.evdev, "openers", cli.evdev.openers)
+        cli.evdev.openers = lambda paths, ignore=(): looked.append(paths) or {p: [] for p in paths}
+        said = self.listing([self.Device("/dev/input/event0",
+                                         error=errno.ENODEV)])
+        self.assertIn("no such device", said)
+        self.assertEqual(looked, [])
 
     def test_a_device_btkey_does_not_want(self):
         said = self.listing([], others=[("/dev/input/event0", "Power Button")])
-        self.assertIn("-", said)
-        self.assertNotIn("grab", said)
-        self.assertNotIn("held", said)
+        self.assertIn("ignored", said)
+        self.assertNotIn("available", said)
+        self.assertNotIn("in use", said)
 
     def test_whatever_discover_picks_is_what_is_listed(self):
         """Including a companion, which the listing cannot work out itself.
@@ -366,12 +447,13 @@ class ListDevicesTest(unittest.TestCase):
         """
         media = self.Device("/dev/input/event6", "USB keyboard media keys")
         said = self.listing([media], others=[("/dev/input/event0", "Power")])
-        self.assertIn("grab   USB keyboard media keys", said)
+        self.assertIn("available        USB keyboard media keys", said)
+        self.assertIn("event6", said)
 
     def test_another_failure_is_named_for_what_it_was(self):
         said = self.listing([self.Device("/dev/input/event0",
                                          error=errno.ENODEV)])
-        self.assertIn("No such device", said)
+        self.assertIn("no such device", said)
 
     def test_a_device_it_took_is_given_straight_back(self):
         # Holding it would take the keyboard from the console for as long
@@ -385,9 +467,71 @@ class ListDevicesTest(unittest.TestCase):
         # Sorting by name puts event10 between event1 and event2.
         said = self.listing([self.Device("/dev/input/event%d" % n)
                              for n in (1, 2, 10)])
-        order = [line.split()[0] for line in said.strip().splitlines()]
-        self.assertEqual(order, ["/dev/input/event1", "/dev/input/event2",
-                                 "/dev/input/event10"])
+        order = [line.split()[0] for line in said.strip().splitlines()[1:]]
+        self.assertEqual(order, ["event1", "event2", "event10"])
+
+    def test_a_line_does_not_end_in_padding(self):
+        # Trailing blanks are cells on a braille display, and the last
+        # column is empty when a node could not be opened.
+        for line in (cli.row("event8", "permission denied"),
+                     cli.row("event0", "ignored", "Power Button")):
+            self.assertEqual(line, line.rstrip())
+
+    def test_a_reason_reads_as_a_phrase(self):
+        # It sits in a column of lowercase phrases; strerror capitalises.
+        self.assertEqual(cli.reason(OSError(errno.EACCES,
+                                            "Permission denied")),
+                         "permission denied")
+
+    def test_an_errno_with_nothing_to_say_still_says_something(self):
+        self.assertEqual(cli.reason(OSError()), "cannot be opened")
+
+    def test_a_node_keeps_its_name_and_loses_the_directory(self):
+        self.assertEqual(cli.short("/dev/input/event3"), "event3")
+
+    def test_anything_elsewhere_is_shown_whole(self):
+        # Nothing outside the directory reaches the listing today, but
+        # trimming a fixed number of characters off one that did would
+        # produce a path that names nothing.
+        self.assertEqual(cli.short("/dev/other/event3"),
+                         "/dev/other/event3")
+
+    def test_the_heading_says_where_the_nodes_are(self):
+        """The directory is in the heading, not on every line.
+
+        It is the same eleven characters on every row, and these are
+        read a cell at a time on a braille display.
+        """
+        said = self.listing([self.Device("/dev/input/event1")])
+        heading = said.splitlines()[0]
+        self.assertTrue(heading.startswith("/dev/input/*"), heading)
+        self.assertIn("event1", said)
+        self.assertNotIn("/dev/input/event1", said)
+
+    def test_a_node_that_cannot_be_opened_says_why(self):
+        """Not "ignored": btkey has no idea what it is.
+
+        A node it cannot open is the one case where the listing has no
+        answer, and saying so is different from saying it looked and
+        decided against it.  The kernel's own words are the honest ones,
+        and there is nothing to put after them: the name cannot be read
+        without opening it.
+        """
+        def refuse(path):
+            raise OSError(errno.EACCES, "Permission denied")
+
+        self.addCleanup(setattr, cli.evdev, "InputDevice",
+                        cli.evdev.InputDevice)
+        self.addCleanup(setattr, cli.glob, "glob", cli.glob.glob)
+        self.addCleanup(setattr, cli.evdev, "discover", cli.evdev.discover)
+        cli.evdev.discover = lambda extra=(), known=(): ([], [])
+        cli.evdev.InputDevice = refuse
+        cli.glob.glob = lambda pattern: ["/dev/input/event3"]
+        cli.list_devices([])
+        said = self.out.getvalue()
+        self.assertIn("event3", said)
+        self.assertIn("permission denied", said)
+        self.assertNotIn("ignored", said)
 
 
 class CommandDispatchTest(unittest.TestCase):

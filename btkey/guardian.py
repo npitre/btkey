@@ -35,10 +35,14 @@ The parent blocks until that has happened, because otherwise a kill arriving
 early enough would win the race.
 """
 
+import fcntl
 import os
 import select
 import signal
+import struct
 import subprocess
+
+from .evdev import EVIOCSREP
 
 # Patched by the tests; the guardian must reach the VT by device, not
 # through a stdout that has died along with the process it belonged to.
@@ -98,6 +102,24 @@ class Guardian:
         """Undo the DECSTBM scrolling region on that VT."""
         self._send("RESETVT %d" % vt)
 
+    def forget_repeat(self, path):
+        """That keyboard's repeat needs no putting back after all.
+
+        Either btkey has put it back itself, or the device has gone and
+        whatever takes its place is not ours to configure.
+        """
+        self._send("NOREPEAT %s" % path)
+
+    def restore_repeat_on_death(self, path, delay, period):
+        """Put a keyboard's key repeat back if we never get to.
+
+        btkey turns autorepeat off on the keyboards it holds, and that
+        setting belongs to the device: killed before it can undo that,
+        it would leave a keyboard that types one character however long
+        you hold a key, with nothing to say why.
+        """
+        self._send("REPEAT %d %d %s" % (delay, period, path))
+
     def dismiss(self):
         """Clean exit: tell the guardian to stand down and reap it."""
         self._send("DONE")
@@ -123,7 +145,7 @@ def _guard(read_fd, ready_fd):
     except OSError:
         pass
 
-    kills, units, consoles = [], [], []
+    kills, units, consoles, repeats = [], [], [], {}
     watchdog = None
     parent = os.getppid()
     buffer = b""
@@ -156,18 +178,47 @@ def _guard(read_fd, ready_fd):
                 seconds = int(command[9:])
                 watchdog = seconds if seconds > 0 else None
                 continue
-            if command.startswith("KILL "):
-                pid, _, comm = command[5:].partition(" ")
-                kills.append((int(pid), comm))
-            elif command.startswith("SYSTEMCTL "):
-                units.append(command[10:])
-            elif command.startswith("RESETVT "):
-                consoles.append(int(command[8:]))
+            _record(command, kills, units, consoles, repeats)
 
-    _cleanup(kills, units, consoles)
+    _cleanup(kills, units, consoles, repeats)
 
 
-def _cleanup(kills, units, consoles):
+def _record(command, kills, units, consoles, repeats):
+    """File one request from the parent against the day it dies.
+
+    Separate from the loop above so it can be read back without a
+    process to run it in: the loop's own business - the deadline, the
+    heartbeats, DONE - stays there.
+    """
+    if command.startswith("KILL "):
+        pid, _, comm = command[5:].partition(" ")
+        kills.append((int(pid), comm))
+    elif command.startswith("SYSTEMCTL "):
+        units.append(command[10:])
+    elif command.startswith("RESETVT "):
+        consoles.append(int(command[8:]))
+    elif command.startswith("NOREPEAT "):
+        repeats.pop(command[9:], None)
+    elif command.startswith("REPEAT "):
+        # The path is last because it is the field that can hold a
+        # space; taking only two splits leaves it whole.
+        delay, period, path = command[7:].split(" ", 2)
+        repeats[path] = (int(delay), int(period))
+
+
+def _cleanup(kills, units, consoles, repeats=None):
+    for path, (delay, period) in (repeats or {}).items():
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except OSError:
+            continue
+        try:
+            fcntl.ioctl(fd, EVIOCSREP, struct.pack("II", delay, period))
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
     for number in consoles:
         try:
             fd = os.open(CONSOLE_DEVICE % number, os.O_WRONLY | os.O_NOCTTY)

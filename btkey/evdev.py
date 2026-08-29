@@ -28,6 +28,7 @@ from . import keycodes
 EV_SYN = 0x00
 EV_KEY = 0x01
 EV_LED = 0x11
+EV_REP = 0x14
 
 # LED codes happen to run in the same order as the HID keyboard LED report's
 # bits - NumLock, CapsLock, ScrollLock, Compose, Kana - so the host's report
@@ -66,6 +67,8 @@ EVIOCGKEY = _ioc(_IOC_READ, "E", 0x18, KEY_BYTES)
 EVIOCGLED = _ioc(_IOC_READ, "E", 0x19, LED_BYTES)
 EVIOCGBIT_EV = _ioc(_IOC_READ, "E", 0x20, 4)
 EVIOCGBIT_KEY = _ioc(_IOC_READ, "E", 0x20 + EV_KEY, KEY_BYTES)
+EVIOCGREP = _ioc(_IOC_READ, "E", 0x03, 8)
+EVIOCSREP = _ioc(_IOC_WRITE, "E", 0x03, 8)
 
 # A device counts as a keyboard only if it can produce all of these.  That
 # admits real keyboards and BRLTTY's uinput injector - which is what makes
@@ -103,6 +106,12 @@ class InputDevice:
         self.has_leds = self._has_leds()
         self.grabbed = False
         self.saved_leds = None
+        self.saved_repeat = None
+        # Whether btkey has ever held this one.  Losing a keyboard it
+        # had is news; being refused one it never had is not, and the
+        # difference is what stops the two from chasing each other.
+        self.was_held = False
+        self.has_repeat = self._has_repeat()
         self._buffer = b""
 
     def _open(self):
@@ -126,6 +135,9 @@ class InputDevice:
             except OSError:
                 pass
             self.fd = None
+        # The grab belongs to the open file description, so it went with
+        # it.  Saying so here is what lets ungrab_all skip the ioctl.
+        self.grabbed = False
 
     def reopen(self):
         """Open it again after a spell closed.  False if it is gone.
@@ -173,6 +185,14 @@ class InputDevice:
         except OSError:
             return bytes(KEY_BYTES)
         return bytes(buf)
+
+    def _has_repeat(self):
+        buf = bytearray(4)
+        try:
+            fcntl.ioctl(self.fd, EVIOCGBIT_EV, buf)
+        except OSError:
+            return False
+        return bool(struct.unpack("I", buf)[0] & (1 << EV_REP))
 
     def _has_leds(self):
         buf = bytearray(4)
@@ -289,6 +309,55 @@ class InputDevice:
             return False
         return True
 
+    def repeat(self):
+        """How the kernel repeats a held key: (delay, period) in ms."""
+        if self.fd is None or not self.has_repeat:
+            return None
+        buf = bytearray(8)
+        try:
+            fcntl.ioctl(self.fd, EVIOCGREP, buf)
+        except OSError:
+            return None
+        return struct.unpack("II", bytes(buf))
+
+    def set_repeat(self, delay, period):
+        if self.fd is None or not self.has_repeat:
+            return False
+        try:
+            fcntl.ioctl(self.fd, EVIOCSREP, struct.pack("II", delay, period))
+        except OSError:
+            return False
+        return True
+
+    def hush_repeat(self):
+        """Stop the kernel repeating a held key at us.
+
+        A HID keyboard reports which keys are down and lets the host do
+        the repeating, so every autorepeat the kernel generates here is
+        read and thrown away - thirty wakeups a second for as long as a
+        key is held, and holding a modifier is what VoiceOver's chords
+        are made of.
+
+        The setting belongs to the device rather than to this
+        descriptor, so it has to be given back, and it outlives btkey if
+        btkey dies badly.  Both are handled where the LEDs are.
+        """
+        if self.saved_repeat is not None:
+            return None                  # already hushed
+        self.saved_repeat = self.repeat()
+        if self.saved_repeat is None:
+            return None
+        self.set_repeat(0, 0)
+        return self.saved_repeat
+
+    def restore_repeat(self):
+        """Put the repeat back.  Returns what it was, or None if nothing."""
+        if self.saved_repeat is None:
+            return None
+        was, self.saved_repeat = self.saved_repeat, None
+        self.set_repeat(*was)
+        return was
+
     def read_keys(self):
         """Drain the device, returning [(keycode, is_press), ...].
 
@@ -317,38 +386,115 @@ class InputDevice:
         return events
 
 
-def discover(extra_paths=()):
-    """Open every keyboard-like device, plus any explicitly named ones."""
+def openers(paths, ignore=()):
+    """Which processes have each of these devices open, by name.
+
+    Nothing says who holds a *grab*, but holding one means having the
+    device open, so this narrows a bare EBUSY to something worth acting
+    on: "brltty" is an answer, "resource busy" is a question.  A process
+    whose command line mentions btkey is reported as btkey, since its
+    comm is python3 and that would tell nobody anything.
+
+    Every device at once, in one pass over /proc: asking per device
+    would walk every process's descriptors once for each of a dozen
+    nodes.  Needs to see other users' descriptors, so it answers what it
+    can and says nothing about the rest rather than failing.
+    """
+    wanted = {os.path.realpath(path): path for path in paths}
+    found = {path: [] for path in paths}
+    ignore = set(ignore) | {os.getpid()}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) in ignore:
+            continue
+        try:
+            handles = os.listdir("/proc/%s/fd" % entry)
+        except OSError:
+            continue            # gone, or not ours to look at
+        name, seen = None, set()
+        for handle in handles:
+            try:
+                target = os.readlink("/proc/%s/fd/%s" % (entry, handle))
+            except OSError:
+                continue
+            path = wanted.get(target)
+            if path is None or path in seen:
+                continue        # a process with one open twice is one
+            seen.add(path)
+            if name is None:
+                name = _process_name(entry)
+            found[path].append(name)
+    return found
+
+
+def _process_name(pid):
+    try:
+        with open("/proc/%s/cmdline" % pid) as handle:
+            command = handle.read()
+        if "btkey" in command:
+            return "btkey"
+        with open("/proc/%s/comm" % pid) as handle:
+            return handle.read().strip()
+    except OSError:
+        return "pid %s" % pid
+
+
+def discover(extra_paths=(), known=()):
+    """Open every keyboard-like device, plus any explicitly named ones.
+
+    Devices already held are skipped rather than opened afresh: what the
+    open is for - the name, the physical path, which keys and LEDs it has
+    - was learned the first time and does not change.  A rescan otherwise
+    opens every node in the directory, asks it four questions it has
+    already answered, and closes it again, and rescans happen on every
+    switch back to our console.
+
+    Returns the devices that are new, and the paths of everything that is
+    there, which is how the caller tells one that has gone from one it
+    already had.
+    """
     # Resolve the explicit ones first.  They are usually /dev/input/by-id
     # symlinks - the stable form, and the reason the option exists - and
     # deduping on the real path would otherwise let the glob claim the node
     # first, fail the keyboard test, and drop the request silently.
     wanted = {os.path.realpath(path) for path in extra_paths}
-    devices, spare, seen = [], [], set()
+    held = {os.path.realpath(device.path): device for device in known}
+    devices, spare, present, seen = [], [], [], set()
     for path in list(extra_paths) + sorted(glob.glob(DEVICE_GLOB)):
         real = os.path.realpath(path)
         if real in seen:
             continue
         seen.add(real)
+        if real in held:
+            present.append(held[real].path)
+            continue
         try:
             device = InputDevice(path)
         except OSError:
             continue
+        present.append(path)
         if device.is_keyboard() or real in wanted:
             devices.append(device)
         else:
+            # Closed straight away rather than held open until the
+            # second pass decides: nothing here needs its descriptor,
+            # and on a machine with a dozen nodes that is a dozen open
+            # at once to end up with three.  What was learned about it
+            # is kept, so the few that come back cost an open and no
+            # ioctls at all.
+            device.close()
             spare.append(device)
 
     # A second pass, because whether one of these belongs to us depends on
     # the whole first pass having happened: it is the media keys of a
-    # keyboard we are already taking.
-    roots = {device.phys for device in devices if device.phys}
+    # keyboard we are already taking.  The ones already held count as
+    # keyboards we are taking, or a companion arriving on its own would
+    # find no root to belong to.
+    roots = {device.phys for device in list(held.values()) + devices
+             if device.phys}
     for device in spare:
-        if device.is_companion_of(roots):
+        if device.is_companion_of(roots) and device.reopen():
             devices.append(device)
-        else:
-            device.close()
-    return devices
+    return devices, present
 
 
 class KeyboardSet:
@@ -360,8 +506,14 @@ class KeyboardSet:
     the state missing.
     """
 
-    def __init__(self, extra_paths=(), on_event=None, on_debug=None):
+    def __init__(self, extra_paths=(), on_event=None, on_debug=None,
+                 on_repeat_debt=None):
         self.extra_paths = list(extra_paths)
+        # Told when a device's key repeat has been turned off, so that
+        # someone can put it back if btkey never gets the chance - and
+        # told again with None once that debt is settled or void, so
+        # nobody puts back a setting that is no longer ours to restore.
+        self.repeat_debt = on_repeat_debt or (lambda path, repeat: None)
         self.event = on_event or (lambda message: None)
         # Which keyboards came and which did not is worth saying only when
         # it is a problem.  Where another program deliberately holds a
@@ -377,34 +529,36 @@ class KeyboardSet:
 
     def refresh(self):
         """Rescan for hotplugged keyboards.  Returns (added, removed)."""
-        found = {device.path: device for device in discover(self.extra_paths)}
+        found, present = discover(self.extra_paths, list(self.devices.values()))
 
         added = []
-        for path, device in found.items():
-            if path in self.devices:
-                device.close()
-                continue
+        for device in found:
+            path = device.path
             self.devices[path] = device
             if self.asleep:
                 # Discovery opens what it finds, and a set that has given
                 # its descriptors up wants this one closed as well.
                 device.close()
-            elif self.grabbed:
-                # Snapshot before grabbing, as grab_all does, or this one
-                # keeps the phone's lock state when the grab is released.
-                device.saved_leds = device.leds()
-                # If it will not come, grab_all says so, in its own words
-                # and only once; the caller runs it straight after this.
-                device.grab()
+            # Nothing else here: taking a keyboard is grab_all's job, and
+            # both callers run it straight after this.
             added.append(device)
 
+        here = set(present)
         removed = [self.devices.pop(path)
-                   for path in list(self.devices) if path not in found]
+                   for path in list(self.devices) if path not in here]
         return added, removed
 
     def forget(self, device):
+        """Drop a device from the set for good, releasing it on the way.
+
+        Usually it has gone, and then putting its state back fails
+        harmlessly.  Not always, though: read_keys reports a device lost
+        on any error that is not EAGAIN, and a flaky USB keyboard can
+        give EIO while still being perfectly present.  That one would
+        keep the repeat we turned off, for good.
+        """
         self.devices.pop(device.path, None)
-        device.close()
+        self.release(device)
 
     def grab_all(self):
         """Take every keyboard, and say which ones would not come.
@@ -413,19 +567,32 @@ class KeyboardSet:
         program holding a device may let go between one console switch and
         the next, and a keyboard that quietly starts or stops reaching the
         phone is the whole of what "flaky" means from the outside.
+
+        Returns whether a keyboard btkey had is now somebody else's,
+        which is worth looking around after: whatever took it may have
+        published a loopback for the keys it does not want.
         """
         self.grabbed = True
-        held = 0
+        held, lost = 0, False
         for device in self.devices.values():
-            if device.saved_leds is None:
-                device.saved_leds = device.leds()
             if device.grab():
                 held += 1
+                self.take(device)
                 if device.refused:
                     device.refused = False
                     self.debug("%s came free; btkey has it now"
                                % device.name)
-            elif not device.refused:
+            else:
+                lost = lost or device.was_held
+                # Not ours, so hold nothing of it: the descriptor buys
+                # nothing either way, since a device somebody else has
+                # delivers us nothing, and one nobody has reaches the
+                # console too and comes back as text.  It stays in the
+                # set to be tried again on the next switch, which is
+                # cheaper than discovering it afresh and is what lets
+                # the refusal be reported once instead of every time.
+                self.release(device)
+            if not device.grabbed and not device.refused:
                 device.refused = True
                 if device.grab_error == errno.EBUSY:
                     self.debug("could not grab %s; another program holds "
@@ -449,23 +616,40 @@ class KeyboardSet:
         elif self.empty_handed:
             self.empty_handed = False
             self.event("a keyboard came free; typing reaches the phone again")
-
-    def close_all(self):
-        """Give the descriptors up while another console has the screen.
-
-        An ungrabbed device is still an open device: it delivers
-        everything typed on it, so leaving it open means waking for every
-        keystroke meant for somebody else.
-        """
-        self.asleep = True
-        for device in self.devices.values():
-            device.close()
+        return lost
 
     def open_all(self):
         """Take them back.  Returns the ones that are no longer there."""
         self.asleep = False
         return [device for device in self.devices.values()
                 if not device.reopen()]
+
+    def discard_refusals(self):
+        """Forget the keyboards we are not holding.
+
+        They are remembered between switches so a refusal is reported
+        once and the keyboard is retried without being discovered
+        afresh.  That is only worth having while nothing has changed;
+        once something has, the honest answer is to look again.
+        """
+        for device in [held for held in self.devices.values()
+                       if not held.grabbed]:
+            self.forget(device)
+
+    def take(self, device):
+        """Everything that follows from holding a keyboard.
+
+        All of it after the grab, none of it before.  A device that will
+        not come is not ours to read state from or to reconfigure, and a
+        moment later it is closed and forgotten with nothing undone -
+        so anything done to it here would be done for good.
+        """
+        device.was_held = True
+        if device.saved_leds is None:
+            device.saved_leds = device.leds()
+        was = device.hush_repeat()
+        if was is not None:
+            self.repeat_debt(device.path, was)
 
     def held_keys(self):
         """Every key physically down across all keyboards."""
@@ -485,17 +669,39 @@ class KeyboardSet:
             if device.saved_leds is not None:
                 device.set_leds(device.saved_leds)
 
-    def ungrab_all(self):
+    def release(self, device):
+        """Let one keyboard go: take() undone, then closed.
+
+        Every way of letting go arrives here - a switch to another
+        console, the device being unplugged, a grab that would not come,
+        btkey stopping - so that none of them can be the one that
+        forgets a step.  Safe to run twice, and on a device that was
+        never taken, because both of those happen.
+
+        Order matters and is the reason this cannot simply be a close:
+        the LED and repeat writes need the descriptor, and the grab goes
+        with it.
+        """
+        # Hand the LEDs back the way the console had them; the phone's
+        # caps state is no business of a console we no longer own.
+        if device.saved_leds is not None:
+            device.set_leds(device.saved_leds)
+            device.saved_leds = None
+        if device.restore_repeat() is not None:
+            self.repeat_debt(device.path, None)
+        device.close()
+
+    def release_all(self):
+        """Give every keyboard back.
+
+        There is no EVIOCGRAB(0) anywhere in this: the kernel drops a
+        grab when the file description goes, so closing is the ungrab.
+        """
         self.grabbed = False
+        self.asleep = True
         for device in self.devices.values():
-            # Hand the LEDs back the way the console had them; the phone's
-            # caps state is no business of a console we no longer own.
-            if device.saved_leds is not None:
-                device.set_leds(device.saved_leds)
-                device.saved_leds = None
-            device.ungrab()
+            self.release(device)
 
     def close(self):
-        self.ungrab_all()
-        self.close_all()
+        self.release_all()
         self.devices = {}

@@ -14,6 +14,7 @@ is another machine or the power button.
 
 import errno
 import os
+import struct
 import sys
 import tempfile
 import unittest
@@ -50,6 +51,9 @@ class RecordingDevice:
         self.grab_error = None
         self.closed = False
         self.gone = False        # unplugged while we were away
+        self.saved_repeat = None
+        self.repeat_writes = []
+        self.was_held = False
         self.held = set()
         self.led_writes = []
         self._leds = leds
@@ -73,6 +77,7 @@ class RecordingDevice:
         self.grabbed = False
 
     def leds(self):
+        self.trace.append("read leds %s" % self.path)
         return self._leds
 
     def set_leds(self, mask):
@@ -84,6 +89,26 @@ class RecordingDevice:
     def pressed_keys(self):
         return set(self.held)
 
+    def hush_repeat(self):
+        if self.saved_repeat is not None:
+            return None
+        self.saved_repeat = (250, 33)
+        self.repeat_writes.append((0, 0))
+        self.trace.append("hush %s" % self.path)
+        return self.saved_repeat
+
+    def restore_repeat(self):
+        if self.saved_repeat is None:
+            return None
+        was, self.saved_repeat = self.saved_repeat, None
+        if not self.closed:
+            # The real one writes through an ioctl, which fails without
+            # a descriptor - silently, and it still reports what it
+            # meant to put back.
+            self.repeat_writes.append(was)
+            self.trace.append("repeat %s" % self.path)
+        return was
+
     def read_keys(self):
         # Nothing writes to QUIET_PIPE, so no watch on it should ever
         # fire; if one did, the missing method would raise inside a GLib
@@ -93,6 +118,7 @@ class RecordingDevice:
     def close(self):
         self.trace.append("close %s" % self.path)
         self.closed = True
+        self.grabbed = False       # the kernel drops it with the fd
 
     def reopen(self):
         self.trace.append("reopen %s" % self.path)
@@ -107,22 +133,178 @@ class RecordingDevice:
 REAL_KEYBOARD_SET = evdev.KeyboardSet
 
 
-def make_set(*devices, on_event=None, on_debug=None):
+def make_set(*devices, on_event=None, on_debug=None, on_repeat_debt=None):
     """A real KeyboardSet over recording devices, skipping discovery."""
-    keyboards = REAL_KEYBOARD_SET(on_event=on_event, on_debug=on_debug)
+    keyboards = REAL_KEYBOARD_SET(on_event=on_event, on_debug=on_debug,
+                                  on_repeat_debt=on_repeat_debt)
     keyboards.devices = {device.path: device for device in devices}
     return keyboards
 
 
 def keyboard_factory(*devices):
     """A stand-in for evdev.KeyboardSet that yields the real thing."""
-    def factory(extra_paths=(), on_event=None, on_debug=None):
-        keyboards = make_set(*devices, on_event=on_event, on_debug=on_debug)
+    def factory(extra_paths=(), on_event=None, on_debug=None,
+                on_repeat_debt=None):
+        keyboards = make_set(*devices, on_event=on_event, on_debug=on_debug,
+                             on_repeat_debt=on_repeat_debt)
         # Discovery would sweep the injected devices away in favour of
         # whatever this machine really has; refresh has its own tests.
         keyboards.refresh = lambda: ([], [])
         return keyboards
     return factory
+
+
+class LosingOneWeHadTest(unittest.TestCase):
+    """A keyboard that was ours and is now somebody else's.
+
+    That is not the same as one we never had.  Something took it while
+    btkey was on another console, and whatever did may have published a
+    loopback for the keys it does not want - which is the device btkey
+    should be holding instead.  BRLTTY does exactly that when it is set
+    up mid-session.
+    """
+
+    def test_losing_one_we_held_is_reported(self):
+        device = RecordingDevice("/a")
+        keyboards = make_set(device)
+        self.assertFalse(keyboards.grab_all())
+        device.grabbable = False
+        device.grabbed = False
+        self.assertTrue(keyboards.grab_all())
+
+    def test_being_refused_one_we_never_had_is_not(self):
+        # Ordinary, and the whole reason the two are told apart: this is
+        # what stops the looking around from looping.
+        keyboards = make_set(RecordingDevice("/a", grabbable=False))
+        self.assertFalse(keyboards.grab_all())
+
+    def test_the_ones_we_are_not_holding_can_be_discarded(self):
+        held = RecordingDevice("/held")
+        refused = RecordingDevice("/refused", grabbable=False)
+        keyboards = make_set(held, refused)
+        keyboards.grab_all()
+        keyboards.discard_refusals()
+        self.assertEqual(list(keyboards.devices), ["/held"])
+
+    def test_discarding_settles_what_they_owed(self):
+        told = []
+        device = RecordingDevice("/a")
+        keyboards = make_set(device,
+                             on_repeat_debt=lambda p, r: told.append((p, r)))
+        keyboards.grab_all()
+        device.grabbed = False          # let go of while we were away
+        keyboards.discard_refusals()
+        self.assertEqual(told[-1], ("/a", None))
+        self.assertTrue(device.closed)
+
+    def test_a_rediscovered_one_was_never_held_by_us(self):
+        """Which is what makes the second look the last one.
+
+        Discarding drops the object, so the keyboard that comes back is
+        one btkey has no history with; refusing it is then ordinary, and
+        nothing asks for a third look.
+        """
+        device = RecordingDevice("/a")
+        keyboards = make_set(device)
+        keyboards.grab_all()
+        self.assertTrue(device.was_held)
+        keyboards.discard_refusals()    # holds it, so it stays
+        device.grabbed = False
+        keyboards.discard_refusals()
+        again = RecordingDevice("/a", grabbable=False)
+        keyboards.devices["/a"] = again
+        self.assertFalse(keyboards.grab_all())
+
+
+class LettingGoTest(unittest.TestCase):
+    """Every way of letting a keyboard go, against the same list.
+
+    Taking one does four things and letting it go undoes them, and the
+    ways of letting go outnumber the ways of taking: a switch to another
+    console, the device being unplugged, a grab that would not come, and
+    btkey stopping.  Each was written separately and each was a chance
+    to forget a step - which is how the guardian ended up holding
+    withdrawn debts and a still-present keyboard ended up mute.
+
+    So they all go through KeyboardSet.release, and this asks every one
+    of them the same questions.  A new way of letting go that does not
+    come through it fails here rather than in six months.
+    """
+
+    def taken(self):
+        """A set holding one keyboard, with everything take() does done."""
+        told = []
+        device = RecordingDevice("/a", leds=0x04)
+        keyboards = make_set(device,
+                             on_repeat_debt=lambda p, r: told.append((p, r)))
+        keyboards.grab_all()
+        self.assertEqual(device.saved_leds, 0x04)
+        self.assertEqual(device.saved_repeat, (250, 33))
+        self.assertEqual(told, [("/a", (250, 33))])
+        del told[:]
+        return keyboards, device, told
+
+    def check(self, device, told):
+        """What must be true however the keyboard was let go."""
+        self.assertEqual(device.led_writes[-1], 0x04,
+                         "the console's LED state was not handed back")
+        self.assertIsNone(device.saved_leds)
+        self.assertEqual(device.repeat_writes[-1], (250, 33),
+                         "the key repeat was not put back")
+        self.assertIsNone(device.saved_repeat)
+        self.assertEqual(told, [("/a", None)],
+                         "the guardian still thinks it owes a restore")
+        self.assertTrue(device.closed, "the descriptor was not given back")
+        self.assertFalse(device.grabbed)
+
+    def test_releasing_one(self):
+        keyboards, device, told = self.taken()
+        keyboards.release(device)
+        self.check(device, told)
+
+    def test_releasing_the_set(self):
+        keyboards, device, told = self.taken()
+        keyboards.release_all()
+        self.check(device, told)
+
+    def test_forgetting_one(self):
+        keyboards, device, told = self.taken()
+        keyboards.forget(device)
+        self.check(device, told)
+        self.assertEqual(keyboards.devices, {})
+
+    def test_closing_the_set(self):
+        keyboards, device, told = self.taken()
+        keyboards.close()
+        self.check(device, told)
+        self.assertEqual(keyboards.devices, {})
+
+    def test_letting_go_twice_is_harmless(self):
+        # It happens: forget() on a device the switch away already
+        # released, and the teardown after either.
+        keyboards, device, told = self.taken()
+        keyboards.release(device)
+        keyboards.release(device)
+        self.check(device, told)
+
+    def test_switching_to_another_console(self):
+        keyboards, device, told = self.taken()
+        session = make_session(keyboards=lambda *args, **kwargs: keyboards)
+        session.set_foreground(False)
+        self.check(device, told)
+
+    def test_a_grab_that_would_not_come(self):
+        """Taken on one switch, refused on the next: still let go.
+
+        hold_only_what_we_grabbed used to close it directly, which is
+        the shape that leaves a keyboard mute for the rest of the
+        machine's uptime.
+        """
+        keyboards, device, told = self.taken()
+        device.grabbable = False
+        device.grabbed = False
+        keyboards.grab_all()          # tried again, and refused this time
+        self.check(device, told)
 
 
 class RealDeviceLifecycleTest(unittest.TestCase):
@@ -177,6 +359,94 @@ class RealDeviceLifecycleTest(unittest.TestCase):
         before = device.fd
         self.assertTrue(device.reopen())
         self.assertEqual(device.fd, before)
+
+    def test_hushing_records_what_was_there_and_turns_it_off(self):
+        device, _ = self.device()
+        device.has_repeat = True
+        asked = []
+        self.addCleanup(setattr, evdev.fcntl, "ioctl", evdev.fcntl.ioctl)
+
+        def ioctl(fd, request, arg):
+            if request == evdev.EVIOCGREP:
+                arg[:] = struct.pack("II", 250, 33)
+                return 0
+            asked.append(struct.unpack("II", arg))
+            return 0
+
+        evdev.fcntl.ioctl = ioctl
+        self.assertEqual(device.hush_repeat(), (250, 33))
+        self.assertEqual(asked, [(0, 0)])
+        self.assertEqual(device.saved_repeat, (250, 33))
+
+    def test_hushing_a_second_time_does_not_record_the_silence(self):
+        """Saving (0, 0) would mean putting back nothing at all.
+
+        The keyboard would then stay dead for the rest of the session,
+        and the guardian would faithfully restore the deadness too.
+        """
+        device, _ = self.device()
+        device.has_repeat = True
+        device.saved_repeat = (250, 33)
+        self.addCleanup(setattr, evdev.fcntl, "ioctl", evdev.fcntl.ioctl)
+        evdev.fcntl.ioctl = lambda fd, request, arg: 0
+        self.assertIsNone(device.hush_repeat())
+        self.assertEqual(device.saved_repeat, (250, 33))
+
+    def test_a_device_with_no_repeat_is_not_even_asked(self):
+        # A trackpad or a power button has no EV_REP; the ioctl would
+        # fail, which is not a reason to make it.
+        device, _ = self.device()
+        device.has_repeat = False
+        asked = []
+        self.addCleanup(setattr, evdev.fcntl, "ioctl", evdev.fcntl.ioctl)
+        evdev.fcntl.ioctl = lambda fd, request, arg: asked.append(request)
+        self.assertIsNone(device.hush_repeat())
+        self.assertIsNone(device.saved_repeat)
+        self.assertEqual(asked, [])
+
+    def test_restoring_puts_back_what_was_recorded(self):
+        device, _ = self.device()
+        device.has_repeat = True
+        device.saved_repeat = (600, 40)
+        written = []
+        self.addCleanup(setattr, evdev.fcntl, "ioctl", evdev.fcntl.ioctl)
+        evdev.fcntl.ioctl = (
+            lambda fd, request, arg: written.append(struct.unpack("II", arg)))
+        # It says what it put back, which is how the set knows there was
+        # a debt to withdraw.
+        self.assertEqual(device.restore_repeat(), (600, 40))
+        self.assertEqual(written, [(600, 40)])
+        self.assertIsNone(device.saved_repeat)
+
+    def test_restoring_nothing_says_nothing(self):
+        device, _ = self.device()
+        device.has_repeat = True
+        self.assertIsNone(device.restore_repeat())
+
+    def test_closing_forgets_the_grab(self):
+        device, _ = self.device()
+        device.grabbed = True
+        device.close()
+        self.assertFalse(device.grabbed)
+
+    def test_one_that_came_back_grabs_again_for_real(self):
+        """The bookkeeping has to match what the kernel did.
+
+        Closing drops the grab, so a device that came back still
+        believing it held one would return early from grab(), never
+        issue EVIOCGRAB, and forward nothing for the rest of the run.
+        """
+        device, _ = self.device()
+        grabs = []
+        self.addCleanup(setattr, evdev.fcntl, "ioctl", evdev.fcntl.ioctl)
+        evdev.fcntl.ioctl = lambda fd, request, arg: grabs.append(arg) or 0
+
+        self.assertTrue(device.grab())
+        self.assertEqual(grabs, [1])
+        device.close()
+        device.reopen()
+        self.assertTrue(device.grab())
+        self.assertEqual(grabs, [1, 1], "the second grab never happened")
 
     def test_what_it_learned_survives_the_round_trip(self):
         # Its name and keys belong to the device, not to the descriptor.
@@ -295,49 +565,243 @@ class KeyboardSetTest(unittest.TestCase):
         self.assertTrue(one.grabbed)
         self.assertTrue(two.grabbed)
 
-    def test_grab_all_snapshots_the_console_leds_first(self):
-        # Before the grab, or the saved state is whatever the phone had.
+    def test_a_grabbed_keyboard_stops_repeating(self):
+        """Autorepeat is thirty wakeups a second we throw away.
+
+        A HID keyboard reports which keys are down and the host does the
+        repeating, so every repeat the kernel makes here is read and
+        dropped - for as long as a key is held, and holding a modifier
+        is what VoiceOver's chords are made of.
+        """
+        device = RecordingDevice("/a")
+        make_set(device).grab_all()
+        self.assertEqual(device.repeat_writes, [(0, 0)])
+
+    def test_it_is_put_back_when_the_keyboard_is_let_go(self):
+        # The setting belongs to the device, not to our descriptor, so
+        # the console would keep whatever we left it.
+        device = RecordingDevice("/a")
+        keyboards = make_set(device)
+        keyboards.grab_all()
+        keyboards.release_all()
+        self.assertEqual(device.repeat_writes, [(0, 0), (250, 33)])
+
+    def test_it_is_put_back_before_the_descriptor_goes(self):
+        device = RecordingDevice("/a")
+        keyboards = make_set(device)
+        keyboards.grab_all()
+        keyboards.close()
+        self.assertLess(device.trace.index("repeat /a"),
+                        device.trace.index("close /a"))
+
+    def test_hushing_twice_does_not_save_the_hush(self):
+        """The second snapshot would be the silence we just installed.
+
+        Then putting it back would put back nothing, and the keyboard
+        would stay dead for the rest of the session.
+        """
+        device = RecordingDevice("/a")
+        keyboards = make_set(device)
+        keyboards.grab_all()
+        keyboards.grab_all()
+        keyboards.release_all()
+        self.assertEqual(device.repeat_writes, [(0, 0), (250, 33)])
+
+    def test_one_that_would_not_come_is_left_alone(self):
+        # Not ours to reconfigure.
+        device = RecordingDevice("/a", grabbable=False)
+        make_set(device).grab_all()
+        self.assertEqual(device.repeat_writes, [])
+
+    def test_the_undo_is_handed_over_when_it_is_hushed(self):
+        """So that something can put it back if btkey never can.
+
+        Killed while holding the keyboard, btkey would otherwise leave
+        one that types a single character however long a key is held.
+        """
+        told = []
+        device = RecordingDevice("/a")
+        make_set(device, on_repeat_debt=lambda p, r: told.append((p, r))
+                 ).grab_all()
+        self.assertEqual(told, [("/a", (250, 33))])
+
+    def test_it_is_handed_over_once(self):
+        told = []
+        keyboards = make_set(RecordingDevice("/a"),
+                             on_repeat_debt=lambda p, r: told.append(p))
+        keyboards.grab_all()
+        keyboards.grab_all()
+        self.assertEqual(told, ["/a"])
+
+    def test_the_debt_is_withdrawn_when_we_put_it_back(self):
+        """Leaving it standing would have the guardian undo the wrong thing.
+
+        btkey hands the repeat back itself on the way to another
+        console.  If the record stayed, and someone set that keyboard's
+        repeat rate themselves meanwhile, a btkey killed while
+        backgrounded would quietly put the old rate back over theirs.
+        """
+        told = []
+        device = RecordingDevice("/a")
+        keyboards = make_set(device,
+                             on_repeat_debt=lambda p, r: told.append((p, r)))
+        keyboards.grab_all()
+        keyboards.release_all()
+        self.assertEqual(told, [("/a", (250, 33)), ("/a", None)])
+
+    def test_a_keyboard_that_went_away_takes_its_debt_with_it(self):
+        """The node has gone, so there is nothing to put back.
+
+        And whatever takes that event number next is a different
+        keyboard: setting this one's repeat on it would be somebody
+        else's surprise, arriving only if btkey were killed.
+        """
+        told = []
+        device = RecordingDevice("/a")
+        keyboards = make_set(device,
+                             on_repeat_debt=lambda p, r: told.append((p, r)))
+        keyboards.grab_all()
+        keyboards.forget(device)
+        self.assertEqual(told, [("/a", (250, 33)), ("/a", None)])
+        self.assertIsNone(device.saved_repeat)
+
+    def test_one_dropped_while_still_there_gets_its_repeat_back(self):
+        """A device is dropped on any read error, not only on going away.
+
+        read_keys reports it lost for anything that is not EAGAIN, and a
+        flaky USB keyboard can give EIO while still sitting there.  That
+        one would otherwise keep the repeat btkey turned off, for good,
+        with the guardian's undo withdrawn in the same breath.
+        """
+        told = []
+        device = RecordingDevice("/a")
+        keyboards = make_set(device,
+                             on_repeat_debt=lambda p, r: told.append((p, r)))
+        keyboards.grab_all()
+        keyboards.forget(device)
+        self.assertEqual(device.repeat_writes, [(0, 0), (250, 33)])
+        self.assertEqual(told, [("/a", (250, 33)), ("/a", None)])
+
+    def test_forgetting_one_that_was_never_hushed_says_nothing(self):
+        told = []
+        device = RecordingDevice("/a")
+        keyboards = make_set(device,
+                             on_repeat_debt=lambda p, r: told.append(p))
+        keyboards.forget(device)
+        self.assertEqual(told, [])
+
+    def test_taking_it_again_records_the_debt_afresh(self):
+        # The rate may have been changed while we were away, so what is
+        # handed over has to be what is there now, not what was there.
+        told = []
+        device = RecordingDevice("/a")
+        keyboards = make_set(device,
+                             on_repeat_debt=lambda p, r: told.append(r))
+        keyboards.grab_all()
+        keyboards.release_all()
+        keyboards.grab_all()
+        self.assertEqual(told, [(250, 33), None, (250, 33)])
+
+    def test_the_console_leds_are_snapshotted_when_we_take_it(self):
+        """After the grab, and before anything writes them.
+
+        What the saved state must not be is the phone's, which is why
+        this has to happen before push_leds; the grab itself changes
+        nothing, so it belongs on the far side of it with the rest of
+        the taking.
+        """
         device = RecordingDevice("/a", leds=0x04)
         make_set(device).grab_all()
         self.assertEqual(device.saved_leds, 0x04)
-        self.assertEqual(device.trace, ["grab /a"])
+        self.assertLess(device.trace.index("grab /a"),
+                        device.trace.index("read leds /a"))
 
-    def test_ungrab_all_releases_every_keyboard(self):
-        one, two = RecordingDevice("/a"), RecordingDevice("/b")
-        keyboards = make_set(one, two)
+    def test_the_snapshot_is_not_taken_twice(self):
+        """The second one would be the phone's lock state, not the console's.
+
+        grab_all runs on every switch back, and push_leds puts the
+        phone's state onto the keyboards straight after it.  Snapshotting
+        again would save that, and the console would be handed the
+        phone's caps lock when btkey let go.
+        """
+        device = RecordingDevice("/a", leds=0x04)
+        keyboards = make_set(device)
         keyboards.grab_all()
-        keyboards.ungrab_all()
-        self.assertFalse(one.grabbed)
-        self.assertFalse(two.grabbed)
+        device.set_leds(0x02)          # what push_leds does, from the phone
+        keyboards.grab_all()
+        self.assertEqual(device.saved_leds, 0x04)
+        keyboards.release_all()
+        self.assertEqual(device.led_writes[-1], 0x04)
+
+    def test_one_that_would_not_come_is_left_entirely_alone(self):
+        """Nothing is done to a keyboard that is somebody else's.
+
+        It is closed and forgotten a moment later with none of this
+        undone, so anything done here would be done for good: its LED
+        state read for a restore that never happens, its key repeat
+        turned off for the rest of the machine's uptime, and the
+        guardian told to put back a setting on a device btkey never
+        held.
+        """
+        told = []
+        device = RecordingDevice("/a", grabbable=False)
+        make_set(device,
+                 on_repeat_debt=lambda p, r: told.append(p)).grab_all()
+        # Tried, refused, and handed straight back: no LED read, no
+        # repeat touched, nothing owed to the guardian.
+        self.assertEqual(device.trace, ["grab /a", "close /a"])
+        self.assertIsNone(device.saved_leds)
+        self.assertIsNone(device.saved_repeat)
+        self.assertEqual(told, [])
+
+    def test_ungrab_all_gives_the_set_up(self):
+        keyboards = make_set(RecordingDevice("/a"), RecordingDevice("/b"))
+        keyboards.grab_all()
+        keyboards.release_all()
         self.assertFalse(keyboards.grabbed)
+
+    def test_closing_is_what_releases_the_keyboard(self):
+        """No EVIOCGRAB(0): the close does it.
+
+        A grab belongs to the open file description, so the kernel drops
+        it when that goes.  Nothing can be holding a second reference:
+        the guardian is forked before any device is opened, and
+        subprocess closes descriptors it does not need.  SETUP.md already
+        leans on this for the case where btkey dies without tidying up.
+        """
+        device = RecordingDevice("/a")
+        keyboards = make_set(device)
+        keyboards.grab_all()
+        keyboards.close()
+        self.assertFalse(device.grabbed)
+        self.assertTrue(device.closed)
+        self.assertNotIn("ungrab /a", device.trace)
 
     def test_ungrab_all_hands_the_console_leds_back(self):
         device = RecordingDevice("/a", leds=0x02)
         keyboards = make_set(device)
         keyboards.grab_all()
         keyboards.set_leds(0x01)          # the phone's num lock
-        keyboards.ungrab_all()
+        keyboards.release_all()
         self.assertEqual(device.led_writes, [0x01, 0x02])
         self.assertIsNone(device.saved_leds)
 
-    def test_the_leds_go_back_before_the_grab_is_released(self):
-        # Once ungrabbed the console owns the LEDs again and will drive
-        # them itself; a write landing after that is a race.
-        device = RecordingDevice("/a")
-        keyboards = make_set(device)
-        keyboards.grab_all()
-        keyboards.ungrab_all()
-        self.assertLess(device.trace.index("leds /a=0x02"),
-                        device.trace.index("ungrab /a"))
-
-    def test_close_releases_before_closing(self):
-        # Closing the fd drops the grab too, but only as a side effect of
-        # the last reference going away - too subtle to rely on.
+    def test_the_leds_go_back_before_the_descriptor_does(self):
+        # The LED write needs the descriptor, and once it is gone the
+        # console owns the lights again and will drive them itself.
         device = RecordingDevice("/a")
         keyboards = make_set(device)
         keyboards.grab_all()
         keyboards.close()
-        self.assertEqual(device.trace[-2:], ["ungrab /a", "close /a"])
+        self.assertLess(device.trace.index("leds /a=0x02"),
+                        device.trace.index("close /a"))
+
+    def test_close_forgets_every_device(self):
+        device = RecordingDevice("/a")
+        keyboards = make_set(device)
+        keyboards.grab_all()
+        keyboards.close()
+        self.assertEqual(device.trace[-1], "close /a")
         self.assertEqual(keyboards.devices, {})
 
     def test_close_covers_every_device(self):
@@ -413,7 +877,7 @@ class KeyboardSetTest(unittest.TestCase):
         device = RecordingDevice("/a", grabbable=False)
         keyboards = make_set(device, on_event=noted.append)
         keyboards.grab_all()
-        keyboards.ungrab_all()
+        keyboards.release_all()
         device.grabbable = True
         keyboards.grab_all()
         self.assertEqual(len(noted), 2, noted)
@@ -425,7 +889,7 @@ class KeyboardSetTest(unittest.TestCase):
                              on_event=noted.append)
         for _ in range(3):
             keyboards.grab_all()
-            keyboards.ungrab_all()
+            keyboards.release_all()
         self.assertEqual(len(noted), 1, noted)
 
     def test_no_devices_at_all_is_not_reported_here(self):
@@ -445,7 +909,7 @@ class KeyboardSetTest(unittest.TestCase):
         keyboards = make_set(device, on_debug=chatter.append)
         for _ in range(3):
             keyboards.grab_all()
-            keyboards.ungrab_all()
+            keyboards.release_all()
         self.assertEqual(len(chatter), 1, chatter)
 
     def test_coming_free_later_is_reported_too(self):
@@ -459,7 +923,7 @@ class KeyboardSetTest(unittest.TestCase):
         device = RecordingDevice("/a", grabbable=False)
         keyboards = make_set(device, on_debug=chatter.append)
         keyboards.grab_all()
-        keyboards.ungrab_all()
+        keyboards.release_all()
         device.grabbable = True
         keyboards.grab_all()
         self.assertEqual(len(chatter), 2, chatter)
@@ -470,7 +934,7 @@ class KeyboardSetTest(unittest.TestCase):
         keyboards = make_set(RecordingDevice("/a"), on_event=noted.append,
                              on_debug=chatter.append)
         keyboards.grab_all()
-        keyboards.ungrab_all()
+        keyboards.release_all()
         keyboards.grab_all()
         self.assertEqual(noted, [])
         self.assertEqual(chatter, [])
@@ -478,7 +942,7 @@ class KeyboardSetTest(unittest.TestCase):
     def test_closing_them_all_gives_every_descriptor_up(self):
         one, two = RecordingDevice("/a"), RecordingDevice("/b")
         keyboards = make_set(one, two)
-        keyboards.close_all()
+        keyboards.release_all()
         self.assertTrue(one.closed and two.closed)
 
     def test_a_sleeping_set_closes_what_discovery_opens(self):
@@ -491,7 +955,7 @@ class KeyboardSetTest(unittest.TestCase):
         """
         arrival = RecordingDevice("/new")
         keyboards = make_set()
-        keyboards.close_all()
+        keyboards.release_all()
         self.discovering(arrival)
         added, _ = keyboards.refresh()
         self.assertEqual(added, [arrival])
@@ -509,7 +973,7 @@ class KeyboardSetTest(unittest.TestCase):
         # plugged in for the rest of the run is closed on discovery.
         arrival = RecordingDevice("/new")
         keyboards = make_set()
-        keyboards.close_all()
+        keyboards.release_all()
         keyboards.open_all()
         self.discovering(arrival)
         keyboards.refresh()
@@ -518,14 +982,21 @@ class KeyboardSetTest(unittest.TestCase):
     def discovering(self, *devices):
         """Put known devices in discovery's way, for refresh() to find."""
         saved = evdev.discover
-        evdev.discover = lambda extra_paths=(): list(devices)
+
+        def fake(extra_paths=(), known=()):
+            # Everything that is there, held or new, is what refresh
+            # reads to decide what has gone away.
+            return (list(devices),
+                    [device.path for device in list(known) + list(devices)])
+
+        evdev.discover = fake
         self.addCleanup(setattr, evdev, "discover", saved)
 
     def test_opening_them_again_reports_the_ones_that_went(self):
         here, gone = RecordingDevice("/a"), RecordingDevice("/b")
         gone.gone = True
         keyboards = make_set(here, gone)
-        keyboards.close_all()
+        keyboards.release_all()
         self.assertEqual(keyboards.open_all(), [gone])
         self.assertFalse(here.closed)
 
@@ -585,7 +1056,7 @@ class SessionGrabTest(unittest.TestCase):
         session.link.send_keyboard = watched
         session.set_foreground(False)
         self.assertIn("report", trace)
-        self.assertLess(trace.index("report"), trace.index("ungrab /a"))
+        self.assertLess(trace.index("report"), trace.index("close /a"))
 
     def grabbing_session(self, *devices, **overrides):
         """A session whose every console line is collected.
@@ -703,7 +1174,7 @@ class SessionGrabTest(unittest.TestCase):
         self.assertTrue(device.grabbed)
         self.assertEqual(device.saved_leds, 0x04)
 
-        keyboards.ungrab_all()
+        keyboards.release_all()
         self.assertEqual(device.led_writes, [0x04])
 
     def test_startup_failure_still_gives_the_keyboards_back(self):

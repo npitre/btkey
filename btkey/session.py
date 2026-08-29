@@ -107,7 +107,8 @@ class Session:
         self.guardian = keeper
         self.btd = None
         self.keyboards = evdev.KeyboardSet(options.device, on_event=self.log,
-                                           on_debug=self.note)
+                                           on_debug=self.note,
+                                           on_repeat_debt=self.repeat_debt)
         self.watches = {}
         self.device_monitor = None
         self.device_settle = None
@@ -159,6 +160,23 @@ class Session:
                                  self.log, self.announce)
 
     # -- output ----------------------------------------------------------
+
+    def repeat_debt(self, path, repeat):
+        """A keyboard's key repeat needs putting back, or no longer does.
+
+        The setting belongs to the device and outlives us, so a btkey
+        killed rather than stopped would leave a keyboard typing one
+        character however long a key is held.  The guardian is already
+        there for exactly this kind of debt - and has to be told when
+        one is settled, or it would put back a stale setting over
+        whatever has been done since.
+        """
+        if self.guardian is None:
+            return
+        if repeat is None:
+            self.guardian.forget_repeat(path)
+        else:
+            self.guardian.restore_repeat_on_death(path, *repeat)
 
     def note(self, message):
         """Detail that is only wanted when something is being chased."""
@@ -476,30 +494,47 @@ class Session:
         """
         for device in self.keyboards.devices.values():
             self.unwatch_device(device)
-        self.keyboards.close_all()
+        self.keyboards.release_all()
 
     def wake_devices(self):
-        """Take them back, and drop the ones that are no longer there."""
+        """Open them again, and drop the ones that are no longer there."""
         for device in self.keyboards.open_all():
             self.log("%s went away" % device.name)
             self.drop_device(device)
-        for device in self.keyboards.devices.values():
-            self.watch_device(device)
 
-    def hold_only_what_we_grabbed(self):
-        """Give back the descriptors of the keyboards that would not come.
+    def take_keyboards(self):
+        """Grab what will come, and look again if we lost one we had.
 
-        A device we hold no grab on is either somebody else's, and then
-        it delivers us nothing at all, or nobody's, and then its keys
-        reach the console as well and come back to us as text; either
-        way holding it open buys nothing.  It is opened and tried again
-        on the next switch back, so a keyboard that comes free is not
-        lost by this.
+        A keyboard that was ours and is now somebody else's says the
+        picture has changed since the last look: whatever took it may
+        have published a loopback for the keys it does not want, which
+        is the device btkey should be holding instead.  BRLTTY does
+        exactly that when it is set up mid-session.
+
+        The second pass cannot start a third.  Everything discarded is
+        forgotten first, so anything refused on the way round again was
+        never held by us, and it is being held that makes a refusal
+        worth looking around after.
+        """
+        if self.keyboards.grab_all():
+            self.keyboards.discard_refusals()
+            self.rescan_devices()
+            self.keyboards.grab_all()
+        self.watch_held_devices()
+
+    def watch_held_devices(self):
+        """Wake for the keyboards we hold, and for no others.
+
+        There is nothing in between: a keyboard is one btkey has the
+        grab on, or it is one btkey has let go of and will try again
+        later.  Watching anything else would wake us for keys that
+        either never arrive or arrive twice.
         """
         for device in self.keyboards.devices.values():
-            if not device.grabbed:
+            if device.grabbed:
+                self.watch_device(device)
+            else:
                 self.unwatch_device(device)
-                device.close()
 
     def watch_for_devices(self):
         """Ask to be told when a keyboard is plugged in or pulled out.
@@ -554,11 +589,15 @@ class Session:
 
     def settle_devices(self):
         self.device_settle = None
+        # Something has changed in /dev/input, so what btkey decided
+        # about the keyboards it is not holding was decided about a
+        # different machine.  Look at them afresh.
+        self.keyboards.discard_refusals()
         self.rescan_devices()
         if self.foreground:
             # It arrived while we have the screen, so it is ours to take;
             # otherwise the switch back does this.
-            self.keyboards.grab_all()
+            self.take_keyboards()
         return False
 
     def rescan_devices(self):
@@ -567,8 +606,6 @@ class Session:
             self.drop_device(device)
         for device in added:
             self.log("keyboard appeared: %s" % device.name)
-            if not self.keyboards.asleep:
-                self.watch_device(device)
         if added and self.foreground:
             self.push_leds()
         return True
@@ -587,8 +624,7 @@ class Session:
             self.watch_for_devices()
             self.wake_devices()
             self.rescan_devices()
-            self.keyboards.grab_all()
-            self.hold_only_what_we_grabbed()
+            self.take_keyboards()
             self.sync_modifiers()
             self.push_leds()
             self.watch_myself()
@@ -601,7 +637,6 @@ class Session:
             # Release before letting go, or the phone keeps holding Alt,
             # and hand the LEDs back before the descriptors go.
             self.release_all()
-            self.keyboards.ungrab_all()
             self.sleep_devices()
             self.unwatch_myself()
 
@@ -685,8 +720,10 @@ class Session:
         """
         if self.guardian is None or self.heartbeat_timer is not None:
             return
+        # No beat here: arming is itself a message, and the guardian
+        # counts from the last one it read.  The first timed beat lands
+        # well inside the deadline.
         self.guardian.watch_me(WATCHDOG_SECONDS)
-        self.heartbeat()
         self.heartbeat_timer = GLib.timeout_add(HEARTBEAT_MS, self.heartbeat)
 
     def unwatch_myself(self):
@@ -771,7 +808,6 @@ class Session:
             self.start_services()
             for device in self.keyboards.devices.values():
                 self.log("using keyboard: %s" % device.name)
-                self.watch_device(device)
             self.announce("btkey ready on VT %d. Alt+F1 to F12 switches "
                           "console, Alt+Escape quits."
                           % self.consoles.vt)

@@ -14,6 +14,7 @@ since a signalled child stays visible as a zombie until it is reaped.
 
 import os
 import shutil
+import struct
 import signal
 import subprocess
 import sys
@@ -168,6 +169,119 @@ class WatchdogTest(unittest.TestCase):
         _, status = os.waitpid(pid, 0)
         self.assertTrue(os.WIFEXITED(status), "watchdog fired spuriously")
         self.assertEqual(os.WEXITSTATUS(status), 7)
+
+
+class RepeatRestoreTest(unittest.TestCase):
+    """Key repeat belongs to the device and outlives btkey.
+
+    btkey turns it off on the keyboards it holds, because a HID keyboard
+    lets the host do the repeating and every repeat the kernel makes is
+    read and thrown away.  Killed before it can undo that, it would
+    leave a keyboard that types one character however long a key is
+    held, with nothing anywhere saying why.
+    """
+
+    def setUp(self):
+        self.directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.directory)
+        self.path = os.path.join(self.directory, "event0")
+        open(self.path, "w").close()
+        self.written = []
+        self.addCleanup(setattr, guardian.fcntl, "ioctl",
+                        guardian.fcntl.ioctl)
+        guardian.fcntl.ioctl = (
+            lambda fd, request, arg: self.written.append((request, arg)))
+
+    def test_it_puts_the_repeat_back(self):
+        guardian._cleanup([], [], [], {self.path: (250, 33)})
+        self.assertEqual(len(self.written), 1)
+        request, arg = self.written[0]
+        self.assertEqual(request, guardian.EVIOCSREP)
+        self.assertEqual(struct.unpack("II", arg), (250, 33))
+
+    def test_a_keyboard_that_has_gone_does_not_stop_the_rest(self):
+        gone = os.path.join(self.directory, "event9")
+        guardian._cleanup([], [], [], {gone: (250, 33),
+                                       self.path: (600, 40)})
+        self.assertEqual(len(self.written), 1)
+
+    def test_nothing_to_put_back_is_not_an_error(self):
+        guardian._cleanup([], [], [])
+        self.assertEqual(self.written, [])
+
+    def test_the_guardian_reads_the_command_back(self):
+        """Parsed by the guardian, not by the test.
+
+        The path is the one field that can hold a space, so it has to be
+        what the split stops at.  Splitting on every space would restore
+        the wrong device or none, and nobody would find out until they
+        held a key down.
+        """
+        repeats = {}
+        guardian._record("REPEAT 250 33 /dev/input/by-id/my keyboard",
+                         [], [], [], repeats)
+        self.assertEqual(repeats,
+                         {"/dev/input/by-id/my keyboard": (250, 33)})
+
+    def test_a_withdrawn_debt_leaves_nothing_to_put_back(self):
+        """btkey put it back itself, or the keyboard has gone.
+
+        Either way the guardian must not, or it would undo whatever has
+        been done to that device since - including on a keyboard that is
+        no longer the one this was measured from.
+        """
+        repeats = {}
+        guardian._record("REPEAT 250 33 /dev/input/event0",
+                         [], [], [], repeats)
+        guardian._record("NOREPEAT /dev/input/event0", [], [], [], repeats)
+        self.assertEqual(repeats, {})
+
+    def test_withdrawing_one_leaves_the_others(self):
+        repeats = {}
+        for command in ("REPEAT 250 33 /dev/input/event0",
+                        "REPEAT 600 40 /dev/input/event1",
+                        "NOREPEAT /dev/input/event0"):
+            guardian._record(command, [], [], [], repeats)
+        self.assertEqual(repeats, {"/dev/input/event1": (600, 40)})
+
+    def test_withdrawing_one_nobody_owes_is_harmless(self):
+        guardian._record("NOREPEAT /dev/input/event9", [], [], [], {})
+
+    def test_the_withdrawal_survives_the_wire(self):
+        sent = []
+        keeper = guardian.Guardian.__new__(guardian.Guardian)
+        keeper._send = sent.append
+        keeper.forget_repeat("/dev/input/by-id/my keyboard")
+        repeats = {"/dev/input/by-id/my keyboard": (250, 33)}
+        guardian._record(sent[0], [], [], [], repeats)
+        self.assertEqual(repeats, {})
+
+    def test_the_other_commands_still_read_back(self):
+        kills, units, consoles, repeats = [], [], [], {}
+        for command in ("KILL 42 bluetoothd", "SYSTEMCTL bluetooth.service",
+                        "RESETVT 4"):
+            guardian._record(command, kills, units, consoles, repeats)
+        self.assertEqual(kills, [(42, "bluetoothd")])
+        self.assertEqual(units, ["bluetooth.service"])
+        self.assertEqual(consoles, [4])
+
+    def test_something_it_does_not_know_is_ignored(self):
+        guardian._record("NONSENSE", [], [], [], {})   # must not raise
+
+    def test_the_command_survives_the_wire(self):
+        """It carries a path, which is the only field with a space in it.
+
+        Splitting the wrong way round would restore the wrong device, or
+        none, which is a failure nobody would see until they held a key.
+        """
+        sent = []
+        keeper = guardian.Guardian.__new__(guardian.Guardian)
+        keeper._send = sent.append
+        keeper.restore_repeat_on_death("/dev/input/event0", 250, 33)
+        self.assertEqual(sent, ["REPEAT 250 33 /dev/input/event0"])
+        delay, period, path = sent[0][len("REPEAT "):].split(" ", 2)
+        self.assertEqual((int(delay), int(period), path),
+                         (250, 33, "/dev/input/event0"))
 
 
 class ConsoleResetTest(unittest.TestCase):

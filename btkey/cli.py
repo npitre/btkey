@@ -34,22 +34,51 @@ def list_devices(extra_paths):
     # interface a keyboard keeps its media keys on - which btkey does take,
     # as a companion - was listed as one it would leave alone.
     chosen = {os.path.realpath(device.path): device
-              for device in evdev.discover(extra_paths)}
-    for path in sorted(glob.glob("/dev/input/event*"), key=event_number):
+              for device in evdev.discover(extra_paths)[0]}
+    # The directory in the heading rather than on every line: it is the
+    # same eleven characters twenty times over, and the lines are read
+    # a cell at a time on a braille display.
+    states = grab_states(chosen.values())
+    print(row("/dev/input/*", "status", "keyboard"))
+    for path in sorted(glob.glob(evdev.DEVICE_GLOB), key=event_number):
         device = chosen.get(os.path.realpath(path))
         if device is not None:
-            print("%-22s %-6s %s" % (path, grab_state(device), device.name))
+            print(row(short(path), states[device.path], device.name))
             continue
         try:
             other = evdev.InputDevice(path)
         except OSError as exc:
-            print("%-22s %s" % (path, exc.strerror))
+            # The kernel's own words, which are the honest ones: without
+            # root this is "permission denied", and a node that went
+            # between the listing and the opening is "no such device".
+            # Nothing follows them, there being no name to read without
+            # opening it.
+            print(row(short(path), reason(exc)))
             continue
-        print("%-22s %-6s %s" % (path, "-", other.name))
+        print(row(short(path), "ignored", other.name))
         other.close()
     for device in chosen.values():
         device.close()
     return 0
+
+
+#: One line of --list-devices, heading included so they cannot drift.
+ROW = "%-14s %-16s %s"
+
+
+def row(node, status, name=""):
+    """One line, without the padding that follows a short last column.
+
+    Trailing blanks are cells on a braille display, and the last column
+    is empty for a node that could not be opened at all.
+    """
+    return (ROW % (node, status, name)).rstrip()
+
+
+def short(path):
+    """A node without the directory every one of them shares."""
+    prefix = evdev.DEVICE_DIRECTORY + "/"
+    return path[len(prefix):] if path.startswith(prefix) else path
 
 
 def event_number(path):
@@ -58,14 +87,53 @@ def event_number(path):
     return (int(digits) if digits else -1, path)
 
 
-def grab_state(device):
-    """Take the device for an instant, to see whether it can be taken."""
-    if device.grab():
-        device.ungrab()
-        return "grab"
-    if device.grab_error == errno.EBUSY:
-        return "held"
-    return os.strerror(device.grab_error or 0)
+def grab_states(devices):
+    """What can be taken, what cannot, and who has the ones that cannot.
+
+    Said as a phrase rather than a word: "grab" meant something to
+    whoever wrote it and nothing to anyone reading a listing for the
+    first time.  A refusal is nearly always another program holding the
+    device, and which one is the whole of what anybody wants to know -
+    "used by btkey" means the one already running has it and all is
+    well, "used by brltty" means go and look at that configuration.
+
+    Having a device open is not the same as holding its grab, and on an
+    ordinary machine several processes have every input device open:
+    systemd-logind keeps them all for seat management.  Naming the first
+    one found blames whichever /proc happened to list first, which is
+    how this came to say "used by systemd-logind" for a keyboard BRLTTY
+    had.  What settles it is the devices that *did* come: a process
+    holding one of those open is demonstrably not what stops a grab, so
+    it is not what stopped this one.
+    """
+    states, busy = {}, []
+    for device in devices:
+        if device.grab():
+            device.ungrab()
+            states[device.path] = "available"
+        elif device.grab_error == errno.EBUSY:
+            busy.append(device)
+        else:
+            states[device.path] = reason(
+                OSError(device.grab_error or 0,
+                        os.strerror(device.grab_error or 0)))
+
+    if busy:
+        opened = evdev.openers([device.path for device in devices])
+        harmless = {name for path, state in states.items()
+                    if state == "available" for name in opened[path]}
+        for device in busy:
+            names = [name for name in opened[device.path]
+                     if name not in harmless]
+            states[device.path] = ("used by %s" % ", ".join(names)
+                                   if names else "in use")
+    return states
+
+
+def reason(exc):
+    """An errno as a phrase, to sit among the other phrases."""
+    text = exc.strerror or "cannot be opened"
+    return text[:1].lower() + text[1:]
 
 
 #: Control-FIFO command for each thing a second btkey can ask the first to

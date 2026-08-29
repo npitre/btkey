@@ -127,19 +127,41 @@ foreground, and lets go the instant it is not.  `btkey --list-devices`
 shows what it would take:
 
 ```
-/dev/input/event0      -      Power Button
-/dev/input/event1      grab   AT Translated Set 2 keyboard
-/dev/input/event5      held   Some USB keyboard
-/dev/input/event6      grab   Some USB keyboard Consumer Control
-/dev/input/event7      -      Some USB keyboard System Control
-/dev/input/event4      grab   BRLTTY Linux Screen Driver Keyboard
+/dev/input/*   status           keyboard
+event0         ignored          Power Button
+event1         used by btkey    AT Translated Set 2 keyboard
+event5         used by brltty   Some USB keyboard
+event6         available        Some USB keyboard Consumer Control
+event7         ignored          Some USB keyboard System Control
+event4         available        BRLTTY Linux Screen Driver Keyboard
 ```
 
-`grab` is a device btkey would take, `held` one another program has, and
-`-` one it leaves alone.  Finding out costs a grab and an immediate
-release, since nothing in `/proc` or `/sys` says who holds one; run it
-while btkey is running and everything btkey has shows as `held`, by
-btkey.
+The directory is in the heading rather than on every line, being the
+same eleven characters twenty times over.
+
+`available` is a keyboard btkey would take and nothing is holding, and
+`ignored` one btkey does not want.  Anything else is the program that
+has it: `used by btkey` means the one already running holds it and all
+is well, while a name like `brltty` says where to go and look.  `in use`
+is what is left when the holder cannot be named, which is what happens
+without root, since the answer is read out of other processes' `/proc`
+entries.
+
+Naming it takes some care, because having a device open is not the same
+as holding its grab and on an ordinary machine several processes have
+every input device open - systemd-logind keeps them all for seat
+management.  What settles it is the keyboards that *did* come: a process
+holding one of those open is demonstrably not what stops a grab, so it
+is not what stopped this one either.  Where nothing came, and so nothing
+is ruled out, every opener is named rather than one picked out of them.  A node btkey could not open at all is given the kernel's own
+words instead - `permission denied` without root, `no such device` for
+one that went between the listing and the opening - with nothing after
+them, there being no name to read without opening it.
+
+Whether it can be taken costs a grab and an immediate release, nothing
+reporting who holds a grab.  Who has the device *open* is a different
+question, and one `/proc` does answer - and holding a grab means having
+it open, so the answer is the same in practice.
 
 A device qualifies only if it can produce the whole letter block plus Enter
 and Space.  That admits real keyboards and BRLTTY's uinput injector, which
@@ -243,11 +265,46 @@ keystroke meant for the console that actually has the screen, only to
 throw it away.  They are opened again, and anything that was unplugged
 meanwhile is dropped, on the way back.
 
-Only the ones that came are kept.  A keyboard btkey holds no grab on is
-either somebody else's, and then it delivers nothing at all, or nobody's,
-and then its keys reach the console too and arrive here a second time as
-text; either way the descriptor buys nothing.  It is opened and tried
-again on the next switch back, so one that comes free is not lost.
+A keyboard btkey holds also stops repeating.  A HID keyboard reports
+which keys are down and the host does the repeating itself, so every
+autorepeat the kernel generates here is read and thrown away: thirty
+wakeups a second for as long as a key is held, and holding a modifier is
+what VoiceOver's chords are made of.  `EVIOCSREP` turns it off.
+
+That setting belongs to the device rather than to btkey's descriptor, so
+it is put back with the LEDs when the keyboard is let go, and the
+guardian is told how to put it back too.  Killed rather than stopped,
+btkey would otherwise leave a keyboard that types one character however
+long you hold a key, with nothing anywhere saying why.
+
+The guardian is also told when it no longer owes that, which matters as
+much.  btkey hands the repeat back itself on the way to another console,
+and a record left standing would have the guardian put the old rate back
+over anything set since; a keyboard that is unplugged cannot have its
+repeat restored at all, and whatever takes its event number next is a
+different device that nobody should be configuring on its behalf.
+
+There is no in between.  A keyboard is one btkey holds the grab on, or
+it is one btkey has handed straight back: a device somebody else has
+delivers nothing at all, and one nobody has reaches the console too and
+arrives here a second time as text, so a descriptor btkey does not hold
+the grab on buys nothing either way.  Only what is held is kept open,
+and only what is held is watched.
+
+What is remembered is that the keyboard exists.  It is tried again on the
+next switch back rather than discovered afresh, which costs nothing, and
+remembering it is also what lets the refusal be reported once instead of
+at every switch.
+
+That memory is dropped as soon as anything changes: a node appearing or
+going in `/dev/input`, or a keyboard btkey was holding turning out to be
+somebody else's now.  Both mean the arrangement is not the one those
+decisions were made about - and the second especially, since whatever
+took the keyboard may have published a loopback for the keys it does not
+want, which is the device btkey should be holding instead.  Losing one
+is worth a second look; being refused one that was never ours is
+ordinary, and telling those apart is what keeps the looking from going
+round for ever.
 
 The watch on `/dev/input` follows the foreground as well: what is plugged
 in while another console has the screen is that console's business, and

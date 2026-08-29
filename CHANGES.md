@@ -2,6 +2,24 @@
 
 Newest first.
 
+## 0.1.3
+
+- `btkey --list-devices` says what it means.  Every keyboard is
+  `available`, `ignored`, or `used by` the program that has it, with the
+  directory in a heading rather than repeated down the page.  Working
+  out which program has a keyboard turns out to take some care, and it
+  named the wrong one at first.
+
+- If something takes a keyboard away from btkey while you are on another
+  console - BRLTTY set up mid-session, say - btkey looks again when it
+  comes back, and picks up the loopback keyboard that program leaves
+  behind rather than simply losing it.
+
+- Holding a key down no longer wakes btkey thirty times a second.  The
+  phone does its own repeating, so btkey turns the kernel's off on the
+  keyboards it holds, and puts it back afterwards - including if it is
+  killed rather than stopped.
+
 ## 0.1.2
 
 - btkey costs nothing to leave running.  It used to wake up twenty-five

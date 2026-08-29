@@ -168,15 +168,32 @@ class HotplugNoticeTest(unittest.TestCase):
         run_loop(session_module.DEVICE_SETTLE_MS + 300)
         self.assertEqual(self.looks, [])
 
-    def test_a_keyboard_arriving_while_we_have_the_screen_is_grabbed(self):
-        device = RecordingDevice("/a")
+    def test_a_change_forgets_the_keyboards_we_were_not_holding(self):
+        """What was decided about them was decided about another machine.
+
+        A keyboard btkey could not grab is remembered so it can be tried
+        again cheaply and complained about once.  A node appearing or
+        going says the arrangement has changed - something started or
+        stopped, and it may be the very thing that was holding it - so
+        the memory is dropped and they are looked at afresh.
+
+        The one being held is not touched: it is not a decision, it is a
+        keyboard.
+        """
+        refused = RecordingDevice("/refused", grabbable=False)
+        ours = RecordingDevice("/ours")
         session = self.session()
         session.set_foreground(True)
-        session.keyboards.devices["/a"] = device
+        session.keyboards.devices.update({"/refused": refused,
+                                          "/ours": ours})
+        session.keyboards.grab_all()
+        self.assertTrue(ours.grabbed)
+
         session.watch_for_devices()
         self.touch("event99")
         run_loop(session_module.DEVICE_SETTLE_MS + 300)
-        self.assertTrue(device.grabbed)
+        self.assertNotIn("/refused", session.keyboards.devices)
+        self.assertIn("/ours", session.keyboards.devices)
 
     def test_a_keyboard_arriving_while_away_is_not_watched(self):
         """Nothing is read from it until the screen comes back.
@@ -199,10 +216,18 @@ class HotplugNoticeTest(unittest.TestCase):
         session.foreground = False
         session.set_foreground(True)
         arrival = RecordingDevice("/new")
-        session.keyboards.refresh = lambda: ([arrival], [])
+
+        def refresh():
+            # What the real one does: the set is where it lands, which
+            # is where grab_all and the watch both look for it.
+            session.keyboards.devices["/new"] = arrival
+            return [arrival], []
+
+        session.keyboards.refresh = refresh
         session.watch_for_devices()
         self.touch("event99")
         run_loop(session_module.DEVICE_SETTLE_MS + 300)
+        self.assertTrue(arrival.grabbed)
         self.assertFalse(arrival.closed)
         self.assertIn("/new", session.watches)
 

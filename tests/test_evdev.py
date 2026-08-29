@@ -12,6 +12,8 @@ import os
 import struct
 import shutil
 import tempfile
+import time
+import subprocess
 import sys
 import unittest
 
@@ -260,11 +262,11 @@ class ExplicitDeviceTest(unittest.TestCase):
         self.addCleanup(setattr, evdev.glob, "glob", self.original_glob)
 
     def test_a_symlink_is_honoured(self):
-        found = evdev.discover([self.link])
+        found, _ = evdev.discover([self.link])
         self.assertEqual([d.path for d in found], [self.link])
 
     def test_the_real_node_is_honoured(self):
-        found = evdev.discover([self.node])
+        found, _ = evdev.discover([self.node])
         self.assertEqual([d.path for d in found], [self.node])
 
     def test_it_is_opened_once_not_twice(self):
@@ -272,7 +274,7 @@ class ExplicitDeviceTest(unittest.TestCase):
         self.assertEqual(len(self.opened), 1)
 
     def test_a_device_nobody_asked_for_is_still_filtered(self):
-        self.assertEqual(evdev.discover([]), [])
+        self.assertEqual(evdev.discover([])[0], [])
 
 
 class PhysTest(unittest.TestCase):
@@ -348,6 +350,10 @@ class DiscoverCompanionTest(unittest.TestCase):
                 return not stub.keyboard and stub.phys in roots
             def close(stub):
                 closed.append(stub.name)
+            def reopen(stub):
+                # The real one keeps what it learned and gets a fresh
+                # descriptor; nothing here has one to get.
+                return True
 
         saved_device, evdev.InputDevice = evdev.InputDevice, Stub
         self.addCleanup(setattr, evdev, "InputDevice", saved_device)
@@ -358,12 +364,25 @@ class DiscoverCompanionTest(unittest.TestCase):
         self.addCleanup(setattr, evdev.glob, "glob", saved_glob)
 
     def test_the_companion_is_taken(self):
-        found = [d.name for d in evdev.discover()]
+        found = [d.name for d in evdev.discover()[0]]
         self.assertEqual(sorted(found), ["event0", "event1"])
 
-    def test_the_stranger_is_closed_rather_than_left_open(self):
-        evdev.discover()
-        self.assertEqual(self.closed, ["event2"])
+    def test_nothing_is_held_open_while_the_question_is_decided(self):
+        """Every node that is not a keyboard is closed as it is judged.
+
+        Waiting for the second pass to decide meant a dozen descriptors
+        open at once on a machine with a dozen nodes, to end up holding
+        three.  What was learned about each one is kept, so the few that
+        come back cost an open and no ioctls.
+        """
+        found, _ = evdev.discover()
+        self.assertEqual(sorted(self.closed), ["event1", "event2"])
+        self.assertIn("event1", [device.name for device in found],
+                      "the companion should have been taken back")
+
+    def test_the_stranger_is_not_taken_back(self):
+        found, _ = evdev.discover()
+        self.assertNotIn("event2", [device.name for device in found])
 
     def test_it_needs_the_whole_first_pass_to_decide(self):
         # event1 is only worth taking because event0 was found, and event0
@@ -371,7 +390,7 @@ class DiscoverCompanionTest(unittest.TestCase):
         evdev.glob.glob = lambda pattern: [
             os.path.join(self.directory, name)
             for name in ("event1", "event2", "event0")]
-        found = [d.name for d in evdev.discover()]
+        found = [d.name for d in evdev.discover()[0]]
         self.assertEqual(sorted(found), ["event0", "event1"])
 
 
@@ -424,6 +443,214 @@ class PressedKeysTest(unittest.TestCase):
         device = self.device_holding(42)
         device.fd = None
         self.assertEqual(device.pressed_keys(), set())
+
+
+
+class RediscoveryTest(unittest.TestCase):
+    """A rescan should not relearn what it already knows.
+
+    Every switch back to btkey's console rescans, and every node the
+    directory holds used to be opened, asked its name, its physical path,
+    its keys and its LEDs, and closed again - to arrive at the answers
+    already in hand.  On this machine that is fourteen nodes and about a
+    hundred syscalls, per switch.
+    """
+
+    def setUp(self):
+        self.directory = tempfile.mkdtemp(prefix="btkey-rediscover-")
+        self.addCleanup(shutil.rmtree, self.directory, ignore_errors=True)
+        self.opened, self.closed, self.reopened = [], [], []
+        for name in ("event0", "event1"):
+            with open(os.path.join(self.directory, name), "w"):
+                pass
+
+        test = self
+
+        class Stub:
+            def __init__(self, path):
+                test.opened.append(os.path.basename(path))
+                self.path = path
+                self.name = os.path.basename(path)
+                self.phys = ""
+
+            def is_keyboard(self):
+                return True
+
+            def is_companion_of(self, roots):
+                return False
+
+            def close(self):
+                pass
+
+            def reopen(self):
+                return True
+
+        self.addCleanup(setattr, evdev, "InputDevice", evdev.InputDevice)
+        self.addCleanup(setattr, evdev, "DEVICE_GLOB", evdev.DEVICE_GLOB)
+        evdev.InputDevice = Stub
+        evdev.DEVICE_GLOB = os.path.join(self.directory, "event*")
+
+    def test_a_first_look_opens_everything(self):
+        found, present = evdev.discover()
+        self.assertEqual(sorted(self.opened), ["event0", "event1"])
+        self.assertEqual(len(found), 2)
+        self.assertEqual(len(present), 2)
+
+    def test_a_second_look_opens_nothing(self):
+        found, _ = evdev.discover()
+        del self.opened[:]
+        again, present = evdev.discover(known=found)
+        self.assertEqual(self.opened, [])
+        self.assertEqual(again, [])
+        self.assertEqual(len(present), 2, "held devices must still count")
+
+    def test_only_the_new_one_is_opened(self):
+        found, _ = evdev.discover()
+        del self.opened[:]
+        with open(os.path.join(self.directory, "event2"), "w"):
+            pass
+        again, present = evdev.discover(known=found)
+        self.assertEqual(self.opened, ["event2"])
+        self.assertEqual([d.name for d in again], ["event2"])
+        self.assertEqual(len(present), 3)
+
+    def test_one_that_went_away_is_left_out_of_what_is_there(self):
+        found, _ = evdev.discover()
+        os.unlink(os.path.join(self.directory, "event1"))
+        _, present = evdev.discover(known=found)
+        self.assertEqual([os.path.basename(p) for p in present], ["event0"])
+
+    def test_a_companion_can_still_find_its_keyboard(self):
+        """The root it belongs to may be one we are already holding.
+
+        A keyboard's media-key interface can appear on its own - after a
+        rescan that already took the keyboard - and it is recognised by
+        sharing that keyboard's physical path.  Skipping the keyboard
+        must not lose the path it contributes.
+        """
+        class Keyboard:
+            path, name, phys = "/dev/input/event0", "kbd", "usb-1"
+
+            def is_keyboard(self):
+                return True
+
+            def close(self):
+                pass
+
+            def reopen(self):
+                return True
+
+        test = self
+
+        class Companion:
+            def __init__(self, path):
+                test.opened.append(os.path.basename(path))
+                self.path = path
+                self.name = "media"
+                self.phys = "usb-1"
+
+            def is_keyboard(self):
+                return False
+
+            def is_companion_of(self, roots):
+                return self.phys in roots
+
+            def close(self):
+                test.closed.append(self.name)
+
+            def reopen(self):
+                test.reopened.append(self.name)
+                return True
+
+        evdev.InputDevice = Companion
+        evdev.DEVICE_GLOB = os.path.join(self.directory, "event1")
+        self.reopened = []
+        found, _ = evdev.discover(known=[Keyboard()])
+        self.assertEqual([d.name for d in found], ["media"])
+        # Closed while the first pass ran, and taken back once the
+        # keyboard it belongs to was known.
+        self.assertEqual(self.closed, ["media"])
+        self.assertEqual(self.reopened, ["media"])
+
+
+
+#: Tacked onto each child: say when the file is open, then wait to die.
+READY = "import sys, time; print('ready', flush=True); time.sleep(30)"
+
+
+class OpenersTest(unittest.TestCase):
+    """Naming the program that has a device open.
+
+    A grab refused is nearly always somebody else holding it, and which
+    somebody is the whole of what anyone wants to know: "brltty" is
+    something to act on, "resource busy" is not.  Nothing reports who
+    holds a grab, but holding one means having the device open, and that
+    much /proc does say.
+    """
+
+    def setUp(self):
+        # Not named after btkey: the child's command line carries this
+        # path, and naming a holder btkey is exactly what is under test.
+        handle, self.path = tempfile.mkstemp(prefix="opened-")
+        os.close(handle)
+        self.addCleanup(lambda: os.path.exists(self.path)
+                        and os.unlink(self.path))
+
+    def holding(self, script):
+        """A process with the file open, for as long as the test needs it.
+
+        It says when it has the file, rather than being polled for it:
+        waiting by asking walks every process in /proc each time round,
+        and there is nothing to learn from how long it takes.
+        """
+        child = subprocess.Popen(
+            [sys.executable, "-c", script % self.path + READY],
+            stdout=subprocess.PIPE)
+        self.addCleanup(lambda: (child.kill(), child.wait()))
+        self.assertEqual(child.stdout.readline(), b"ready\n")
+        return child
+
+    def test_nobody_holding_it_is_nobody(self):
+        self.assertEqual(evdev.openers([self.path])[self.path], [])
+
+    def test_a_holder_is_named(self):
+        self.holding("f = open(%r); ")
+        self.assertEqual(evdev.openers([self.path])[self.path], ["python3"])
+
+    def test_btkey_is_named_btkey(self):
+        """Its comm is python3, which would tell nobody anything.
+
+        The one answer somebody reading this listing most needs is that
+        the btkey they are already running has the keyboard, and all is
+        well.
+        """
+        self.holding("btkey = open(%r); ")
+        # The command line mentions btkey, as a real one's would.
+        self.assertEqual(evdev.openers([self.path])[self.path], ["btkey"])
+
+    def test_we_do_not_count_ourselves(self):
+        # list_devices has the device open to try the grab.
+        with open(self.path):
+            self.assertEqual(evdev.openers([self.path])[self.path], [])
+
+    def test_a_process_can_be_left_out(self):
+        child = self.holding("f = open(%r); ")
+        self.assertEqual(evdev.openers([self.path], ignore=[child.pid])[self.path], [])
+
+    def test_one_process_holding_it_twice_is_named_once(self):
+        """A program with the device open twice is still one program.
+
+        btkey itself opens a device read-write and falls back to
+        read-only, and a listing that said "brltty, brltty" would read
+        as two of them.
+        """
+        self.holding("a = open(%r); b = open(a.name); ")
+        self.assertEqual(evdev.openers([self.path])[self.path], ["python3"])
+
+    def test_two_holders_are_both_named(self):
+        self.holding("f = open(%r); ")
+        self.holding("f = open(%r); ")
+        self.assertEqual(evdev.openers([self.path])[self.path], ["python3", "python3"])
 
 
 if __name__ == "__main__":

@@ -85,7 +85,8 @@ class FakeDevice:
 class FakeKeyboards:
     """Stands in for the set of grabbed evdev keyboards."""
 
-    def __init__(self, extra_paths=(), on_event=None, on_debug=None):
+    def __init__(self, extra_paths=(), on_event=None, on_debug=None,
+                 on_repeat_debt=None):
         self.devices = {}
         self.held = set()          # what is physically down right now
         self.leds = None
@@ -95,11 +96,15 @@ class FakeKeyboards:
         self.asleep = False
 
     def held_keys(self): return set(self.held)
+    was_held = False
+    def hush_repeat(self): return None
+    def restore_repeat(self): pass
     def grab_all(self): self.grabbed = True
     def ungrab_all(self): self.grabbed = False
     def refresh(self): return [], []
     def close(self): pass
-    def close_all(self): self.opened = False; self.asleep = True
+    def release_all(self): self.opened = False; self.asleep = True
+    def release(self, device): device.close()
     def open_all(self): self.opened = True; self.asleep = False; return []
 
     def forget(self, device):
@@ -2080,13 +2085,71 @@ class DeviceLifecycleTest(unittest.TestCase):
         self.assertNotIn(device.path, self.session.keyboards.devices)
         self.assertNotIn(device.path, self.session.watches)
 
-    def test_a_keyboard_that_appears_is_watched(self):
+    def test_a_keyboard_that_appears_is_named(self):
+        # Watching it comes later, once grab_all has said whether it is
+        # ours; a rescan on its own only says what is there.
         device = FakeDevice()
-        watched = []
-        self.session.watch_device = watched.append
+        said = []
+        self.session.log = said.append
         self.session.keyboards.refresh = lambda: ([device], [])
         self.session.rescan_devices()
-        self.assertEqual(watched, [device])
+        self.assertTrue([line for line in said if "appeared" in line], said)
+
+    def test_losing_one_we_had_makes_btkey_look_again(self):
+        """Whatever took it may have left us its loopback.
+
+        BRLTTY set up mid-session grabs the keyboard and publishes what
+        it does not want through uinput; that new device is the one to
+        hold, and nothing would have looked for it.
+        """
+        rounds = []
+        self.session.keyboards.grab_all = lambda: rounds.append("grab") or (
+            len(rounds) == 1)          # lost one, the first time round
+        self.session.keyboards.discard_refusals = (
+            lambda: rounds.append("discard"))
+        self.session.rescan_devices = lambda: rounds.append("rescan")
+        self.session.watch_held_devices = lambda: None
+        self.session.take_keyboards()
+        self.assertEqual(rounds, ["grab", "discard", "rescan", "grab"])
+
+    def test_being_refused_one_we_never_had_looks_no_further(self):
+        rounds = []
+        self.session.keyboards.grab_all = (
+            lambda: rounds.append("grab") or False)
+        self.session.rescan_devices = lambda: rounds.append("rescan")
+        self.session.watch_held_devices = lambda: None
+        self.session.take_keyboards()
+        self.assertEqual(rounds, ["grab"])
+
+    def test_the_second_look_cannot_start_a_third(self):
+        # grab_all reporting a loss every time must still terminate.
+        rounds = []
+        self.session.keyboards.grab_all = (
+            lambda: rounds.append("grab") or True)
+        self.session.keyboards.discard_refusals = lambda: None
+        self.session.rescan_devices = lambda: None
+        self.session.watch_held_devices = lambda: None
+        self.session.take_keyboards()
+        self.assertEqual(len(rounds), 2)
+
+    def test_only_a_keyboard_we_hold_is_watched(self):
+        """There is no in between: we have the grab or we have let go.
+
+        Watching one we do not hold would wake btkey for keys that
+        either never arrive, because somebody else has the device, or
+        arrive twice, because nobody does and the console gets them too.
+        """
+        held, refused = FakeDevice(), FakeDevice()
+        held.grabbed, refused.grabbed = True, False
+        held.path, refused.path = "/held", "/refused"
+        self.session.keyboards.devices = {"/held": held,
+                                          "/refused": refused}
+        watched, unwatched = [], []
+        self.session.watch_device = watched.append
+        self.session.unwatch_device = unwatched.append
+        self.session.watch_held_devices()
+        self.assertEqual(watched, [held])
+        self.assertEqual(unwatched, [refused])
 
     def test_a_keyboard_that_is_unplugged_is_forgotten(self):
         device = FakeDevice()
@@ -2215,11 +2278,54 @@ class BackgroundedTest(unittest.TestCase):
         self.assertEqual(self.keeper.watched,
                          [session_module.WATCHDOG_SECONDS])
 
-    def test_taking_the_screen_starts_beating_at_once(self):
-        # Not one interval later: the guardian starts counting now.
+    def told(self, session):
+        """What the guardian is asked to remember, and to forget."""
+        asked = []
+        self.keeper.restore_repeat_on_death = (
+            lambda path, delay, period: asked.append(("keep", path,
+                                                      delay, period)))
+        self.keeper.forget_repeat = lambda path: asked.append(("drop", path))
+        return asked
+
+    def test_a_hushed_keyboard_is_handed_to_the_guardian(self):
+        """The undo has to outlive us, because the setting does.
+
+        btkey killed while holding a keyboard would leave it typing one
+        character however long a key is held, and nothing anywhere
+        saying why.
+        """
+        session = self.session()          # builds self.keeper
+        asked = self.told(session)
+        session.repeat_debt("/dev/input/event0", (250, 33))
+        self.assertEqual(asked, [("keep", "/dev/input/event0", 250, 33)])
+
+    def test_a_settled_debt_is_withdrawn(self):
+        """Or the guardian would put back a setting nobody owes.
+
+        btkey hands the repeat back itself on the way to another
+        console; anything done to that keyboard afterwards is not ours
+        to undo.
+        """
+        session = self.session()
+        asked = self.told(session)
+        session.repeat_debt("/dev/input/event0", None)
+        self.assertEqual(asked, [("drop", "/dev/input/event0")])
+
+    def test_no_guardian_means_nothing_to_hand_it_to(self):
+        session = make_session()
+        session.repeat_debt("/dev/input/event0", (250, 33))   # must not raise
+        session.repeat_debt("/dev/input/event0", None)
+
+    def test_arming_it_is_not_followed_by_a_beat(self):
+        """Arming is itself a message, and that is what it counts from.
+
+        A beat sent in the same breath tells the guardian nothing it did
+        not just learn; the first timed one lands well inside the
+        deadline.
+        """
         session = self.session()
         session.set_foreground(True)
-        self.assertEqual(self.keeper.beats, 1)
+        self.assertEqual(self.keeper.beats, 0)
         self.assertIn(session_module.HEARTBEAT_MS,
                       [ms for ms, _ in self.timers])
 
