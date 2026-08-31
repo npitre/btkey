@@ -21,7 +21,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from btkey import evdev
+from btkey import evdev, keycodes
 
 from test_keys import make_session
 
@@ -54,6 +54,7 @@ class RecordingDevice:
         self.saved_repeat = None
         self.repeat_writes = []
         self.was_held = False
+        self.events = []           # what the next read_keys hands over
         self.held = set()
         self.led_writes = []
         self._leds = leds
@@ -110,10 +111,11 @@ class RecordingDevice:
         return was
 
     def read_keys(self):
-        # Nothing writes to QUIET_PIPE, so no watch on it should ever
-        # fire; if one did, the missing method would raise inside a GLib
-        # callback on a descriptor that stays ready, which is a spin.
-        return []
+        # Nothing writes to QUIET_PIPE, so a watch on it never fires of
+        # its own accord; a test calls the handler directly and this
+        # hands over whatever it queued.
+        events, self.events = self.events, []
+        return events
 
     def close(self):
         self.trace.append("close %s" % self.path)
@@ -152,6 +154,146 @@ def keyboard_factory(*devices):
         keyboards.refresh = lambda: ([], [])
         return keyboards
     return factory
+
+
+#: What the console reaches btkey with, and VoiceOver's own modifier.
+LEFT_CTRL = 29
+
+
+class HeldKeyAtSwitchTest(unittest.TestCase):
+    """Taking the keyboard while a key is still down leaves it stuck.
+
+    Not in btkey - in the console.  The kernel saw the press and never
+    the release, because by then btkey had the grab, so it goes on
+    believing the key is held.  With Ctrl that turns every letter into a
+    control character: r becomes ^R and bash starts searching its
+    history.  Ctrl+Alt+Fn is how this console is reached, and Ctrl is
+    VoiceOver's own modifier, so a key being down at that moment is the
+    ordinary case.
+    """
+
+    def session(self, *devices):
+        session = make_session(keyboards=keyboard_factory(*devices))
+        session.foreground = False
+        return session
+
+    def test_nothing_is_grabbed_while_a_key_is_down(self):
+        device = RecordingDevice("/a")
+        device.held = {LEFT_CTRL}
+        session = self.session(device)
+        session.set_foreground(True)
+        self.assertFalse(device.grabbed)
+
+    def test_it_is_grabbed_once_the_key_comes_up(self):
+        device = RecordingDevice("/a")
+        device.held = {LEFT_CTRL}
+        session = self.session(device)
+        session.set_foreground(True)
+        device.held = set()
+        session.on_device_input(device.fd, None, device)
+        self.assertTrue(device.grabbed)
+
+    def test_a_free_keyboard_is_taken_at_once(self):
+        device = RecordingDevice("/a")
+        session = self.session(device)
+        session.set_foreground(True)
+        self.assertTrue(device.grabbed)
+
+    def test_it_is_watched_while_waiting(self):
+        # Or the release would never be seen and it would wait for ever.
+        device = RecordingDevice("/a")
+        device.held = {LEFT_CTRL}
+        session = self.session(device)
+        session.set_foreground(True)
+        self.assertIn("/a", session.watches)
+
+    def test_nothing_is_forwarded_while_waiting(self):
+        """The console has these keys and is acting on them.
+
+        Forwarding them too would send the phone the second of two: the
+        text arrives through stdin as it always did.
+        """
+        device = RecordingDevice("/a")
+        device.held = {LEFT_CTRL}
+        session = self.session(device)
+        session.set_foreground(True)
+        sent = []
+        session.handle_key = lambda code, press: sent.append(code)
+        device.events = [(30, True)]        # a
+        session.on_device_input(device.fd, None, device)
+        self.assertEqual(sent, [])
+
+    def test_the_leds_are_left_alone_while_waiting(self):
+        """They are the console's lights, showing the console's locks.
+
+        Writing the phone's lock state there would leave them lying,
+        and nothing would put them back: what release hands back is the
+        snapshot take() makes, and an untaken keyboard has none.
+        """
+        device = RecordingDevice("/a", leds=0x04)
+        device.held = {LEFT_CTRL}
+        session = self.session(device)
+        session.set_foreground(True)
+        self.assertFalse(device.grabbed)
+        session.apply_leds(0x02)
+        self.assertEqual(device.led_writes, [])
+
+    def test_the_leds_follow_the_phone_once_it_is_taken(self):
+        device = RecordingDevice("/a", leds=0x04)
+        session = self.session(device)
+        session.set_foreground(True)
+        session.apply_leds(0x02)
+        self.assertEqual(device.led_writes[-1], 0x02)
+
+    def test_a_keyboard_we_do_not_hold_is_never_forwarded(self):
+        """The rule is about the keyboard, not about what btkey is doing.
+
+        Anything btkey has no grab on is either somebody else's, and
+        sends nothing, or the console's, and its keys are already on
+        their way here as text.  Forwarding them would be the second of
+        two however the device came to be watched.
+        """
+        device = RecordingDevice("/a")
+        session = self.session(device)
+        session.set_foreground(True)
+        self.assertTrue(device.grabbed)
+
+        device.grabbed = False          # taken away from under us
+        sent = []
+        session.handle_key = lambda code, press: sent.append(code)
+        device.events = [(30, True)]
+        session.on_device_input(device.fd, None, device)
+        self.assertEqual(sent, [])
+
+    def test_typing_is_forwarded_again_once_it_is_taken(self):
+        """The waiting has to end, not just the grab happen.
+
+        Left set, every key read afterwards would be dropped on the
+        floor as one the console was dealing with, and the phone would
+        hear nothing btkey did not read as text.
+        """
+        device = RecordingDevice("/a")
+        device.held = {LEFT_CTRL}
+        session = self.session(device)
+        session.set_foreground(True)
+        device.held = set()
+        session.on_device_input(device.fd, None, device)   # the release
+        self.assertTrue(device.grabbed)
+        self.assertFalse(session.waiting_for_release)
+
+        sent = []
+        session.handle_key = lambda code, press: sent.append(code)
+        device.events = [(30, True)]                       # a
+        session.on_device_input(device.fd, None, device)
+        self.assertEqual(sent, [30])
+
+    def test_going_away_again_stops_the_waiting(self):
+        device = RecordingDevice("/a")
+        device.held = {LEFT_CTRL}
+        session = self.session(device)
+        session.set_foreground(True)
+        session.set_foreground(False)
+        self.assertFalse(session.waiting_for_release)
 
 
 class LosingOneWeHadTest(unittest.TestCase):

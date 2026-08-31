@@ -284,6 +284,26 @@ over anything set since; a keyboard that is unplugged cannot have its
 repeat restored at all, and whatever takes its event number next is a
 different device that nobody should be configuring on its behalf.
 
+Nothing is taken while a key is down.  The console has seen the press;
+if btkey grabs before the release, the console never sees that release
+and goes on believing the key is held.  With Ctrl that turns every
+letter into a control character - `r` becomes ^R, and bash starts
+searching its history - and it survives btkey exiting, because it is the
+console's state and not btkey's.  Ctrl+Alt+F*n* is how this console is
+reached and Ctrl is VoiceOver's own modifier, so a key being down at
+that moment is the ordinary case rather than a corner.
+
+So btkey waits, watching for the release on the descriptors it already
+has open, in the same poll as everything else.  Nothing read from a
+keyboard btkey does not hold is forwarded - those keys are the console's
+and are already on their way here as text - and the only thing worth
+reading from one is that the last key has come up.  There is no deadline and
+none is wanted: until it grabs, the keyboard is exactly what it was.
+The console handles it, Alt+F*n* still switches, Ctrl+C still
+interrupts, and what is typed still reaches the phone - arriving as text
+on stdin rather than as key positions.  A key that is never released
+costs the exact reporting of positions and nothing else.
+
 There is no in between.  A keyboard is one btkey holds the grab on, or
 it is one btkey has handed straight back: a device somebody else has
 delivers nothing at all, and one nobody has reaches the console too and

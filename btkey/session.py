@@ -113,6 +113,7 @@ class Session:
         self.device_monitor = None
         self.device_settle = None
         self.device_timer = None    # the fallback, where there is no watch
+        self.waiting_for_release = False
         self.heartbeat_timer = None
         self.control_fd = None
 
@@ -332,6 +333,15 @@ class Session:
         # event GLib had already queued when the console changed.
         if not self.foreground:
             return True
+        if not device.grabbed:
+            # Not ours.  The console has these keys and is acting on
+            # them, so forwarding them would send the phone the second
+            # of two - the first arriving as text on stdin.  The only
+            # thing worth reading from a keyboard we do not hold is
+            # that the last key has come up and it can be taken.
+            if self.waiting_for_release and not self.keyboards.held_keys():
+                self.take_keyboards()
+            return True
         for keycode, is_press in events:
             self.handle_key(keycode, is_press)
         return True
@@ -484,6 +494,33 @@ class Session:
     def drop_device(self, device):
         self.unwatch_device(device)
         self.keyboards.forget(device)
+        self.keyboard_gone()
+
+    def keyboard_gone(self):
+        """Tell the phone what is still down, a keyboard having gone.
+
+        Unplugging one is covered without this, by the kernel: it sends
+        key-ups for everything the device was holding before it goes,
+        and evdev hands a reader those buffered events before it reports
+        the device missing, so they arrive here as ordinary releases and
+        are forwarded like any other.
+
+        A keyboard dropped for some other reason sends nothing at all,
+        and a read that fails on one still sitting there is enough to
+        drop it.  The phone would go on holding whatever was down, with
+        no key left anywhere able to lift it.  So what is still held is
+        asked of the keyboards that remain.
+
+        A consumer usage cannot be asked after - it is a report rather
+        than a key, and nothing here records that one is down - so it is
+        simply let go.  Cutting a volume key short is the safe way to be
+        wrong about it; the other way ramps until the phone is unpaired.
+        """
+        still = self.keyboards.held_keys()
+        self.pressed = [code for code in self.pressed if code in still]
+        self.sync_modifiers()
+        self.send_keyboard()
+        self.send_consumer(0)
 
     def sleep_devices(self):
         """Let the keyboards go while another console has them.
@@ -516,11 +553,44 @@ class Session:
         never held by us, and it is being held that makes a refusal
         worth looking around after.
         """
+        if self.keyboards.held_keys():
+            # Not while anything is down.  Grabbing now takes the key
+            # away before the console sees it released, and a console
+            # that believes Ctrl is still held turns every letter into
+            # a control character - r into ^R, and bash into reverse
+            # search.  Ctrl+Alt+Fn is how this console is reached, so
+            # that is the ordinary case rather than a corner.
+            #
+            # There is no deadline on the wait and none is wanted.
+            # Until btkey grabs, the keyboard is exactly what it was:
+            # the console handles it, Alt+Fn still switches, Ctrl+C
+            # still interrupts, and what is typed still reaches the
+            # phone, arriving here as text on stdin instead of as key
+            # positions.  A key that is never released costs the exact
+            # reporting of positions and nothing more.
+            if not self.waiting_for_release:
+                self.waiting_for_release = True
+                self.note("waiting for the keys to come up before "
+                          "taking the keyboard")
+            self.watch_every_device()
+            return
+        self.waiting_for_release = False
+
         if self.keyboards.grab_all():
             self.keyboards.discard_refusals()
             self.rescan_devices()
             self.keyboards.grab_all()
         self.watch_held_devices()
+
+    def watch_every_device(self):
+        """Watch them all, held or not, to see the last key come up.
+
+        Nothing read here is forwarded: the console has these keys and
+        is acting on them, and forwarding as well would send the phone
+        what stdin is about to send it anyway.
+        """
+        for device in self.keyboards.devices.values():
+            self.watch_device(device)
 
     def watch_held_devices(self):
         """Wake for the keyboards we hold, and for no others.
@@ -636,6 +706,7 @@ class Session:
             self.unwatch_for_devices()
             # Release before letting go, or the phone keeps holding Alt,
             # and hand the LEDs back before the descriptors go.
+            self.waiting_for_release = False
             self.release_all()
             self.sleep_devices()
             self.unwatch_myself()

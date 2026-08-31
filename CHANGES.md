@@ -2,6 +2,15 @@
 
 Newest first.
 
+## 0.1.4
+
+- Using btkey could leave the console believing Ctrl was still held,
+  after which `r` started searching bash history.  It now waits for the
+  keys to come up before taking the keyboard.
+
+- A keyboard that goes away while a key is down no longer leaves that
+  key stuck on the phone.
+
 ## 0.1.3
 
 - `btkey --list-devices` says what it means.  Every keyboard is

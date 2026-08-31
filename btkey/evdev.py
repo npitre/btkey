@@ -659,9 +659,16 @@ class KeyboardSet:
         return held
 
     def set_leds(self, mask):
-        """Push a host LED report onto every keyboard that has LEDs."""
+        """Push a host LED report onto the keyboards btkey holds.
+
+        Only those.  One it has not grabbed belongs to the console,
+        which is showing its own lock state on it; writing the phone's
+        there would leave those lights lying, and nothing would put them
+        back - what release restores is the snapshot taken when a
+        keyboard is taken, and an untaken one has none.
+        """
         return [device.name for device in self.devices.values()
-                if device.set_leds(mask)]
+                if device.grabbed and device.set_leds(mask)]
 
     def restore_leds(self):
         """Back to the state the console had, without giving up the grab."""

@@ -2233,6 +2233,75 @@ class ControlCommandTest(unittest.TestCase):
         self.assertTrue(self.feed("cancel\n"))
 
 
+class KeyboardYankedTest(unittest.TestCase):
+    """A keyboard that goes while something is still down on it.
+
+    Unplugged, the kernel sends key-ups for everything it was holding
+    before it disappears, so those arrive as ordinary releases.  Dropped
+    for any other reason - a read that failed on one still sitting there
+    - it sends nothing, and the phone would hold what was down for ever,
+    with no key anywhere able to lift it.
+    """
+
+    def setUp(self):
+        self.session = make_session()
+        self.link = self.session.link
+        self.gone = FakeDevice()
+        self.gone.path = "/gone"
+        self.stayed = FakeDevice()
+        self.stayed.path = "/stayed"
+        self.session.keyboards.devices = {"/gone": self.gone,
+                                          "/stayed": self.stayed}
+
+    def test_what_it_was_holding_is_let_go(self):
+        press(self.session, 30)                 # a, and nothing left down
+        self.session.keyboards.held = set()
+        self.link.reports.clear()
+        self.session.drop_device(self.gone)
+        self.assertEqual(self.session.pressed, [])
+        self.assertEqual(self.link.reports[-1], (0, (0, 0, 0, 0, 0, 0)))
+
+    def test_what_another_keyboard_still_holds_stays_down(self):
+        """Only that keyboard's keys go, not everything.
+
+        Two keyboards is the ordinary arrangement here - the real one
+        and BRLTTY's loopback - and dropping one must not lift what the
+        other is holding.
+        """
+        press(self.session, 30)                 # a
+        # What the keyboards left still report as down.
+        self.session.keyboards.held = {30}
+        self.session.drop_device(self.gone)
+        self.assertEqual(self.session.pressed, [30])
+
+    def test_a_media_key_is_let_go_as_well(self):
+        """Nothing records that one is down; it is a report, not a key.
+
+        Cutting a volume key short is the safe way to be wrong about it.
+        """
+        self.link.consumer.clear()
+        self.session.drop_device(self.gone)
+        self.assertEqual(self.link.consumer, [0])
+
+    def test_a_modifier_that_went_with_it_is_let_go(self):
+        """The one that matters: Ctrl leaves on the keyboard that leaves.
+
+        btkey would otherwise put Ctrl into every report it sent
+        afterwards, and the phone would read the rest of the session as
+        chords.
+        """
+        press(self.session, 29)                 # Ctrl, held nowhere now
+        self.session.keyboards.held = set()
+        self.session.drop_device(self.gone)
+        self.assertEqual(self.session.modifiers, 0)
+
+    def test_a_modifier_another_keyboard_holds_stays(self):
+        press(self.session, 29)
+        self.session.keyboards.held = {29}
+        self.session.drop_device(self.gone)
+        self.assertEqual(self.session.modifiers, keycodes.MOD_LEFTCTRL)
+
+
 class BackgroundedTest(unittest.TestCase):
     """What btkey holds while another console has the screen: nothing.
 
