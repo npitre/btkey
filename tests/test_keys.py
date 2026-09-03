@@ -625,11 +625,12 @@ class PasskeyTest(unittest.TestCase):
 
 
 class ForegroundTest(unittest.TestCase):
-    """Taking the grab back has to start from what is physically held.
+    """Coming back to btkey's console with a key still down.
 
-    A grab only shows transitions.  Anything pressed while we were ungrabbed
-    went to the kernel and never to us, so the modifier state has to be read
-    from the devices rather than assumed empty.
+    A grab only shows transitions, so anything pressed while btkey was
+    ungrabbed went to the kernel and never to it.  btkey answers that by
+    not taking a keyboard until the keys are up, which is also what
+    keeps the console from being left with a modifier stuck.
     """
 
     def setUp(self):
@@ -637,42 +638,71 @@ class ForegroundTest(unittest.TestCase):
         self.link = self.session.link
         self.keyboards = self.session.keyboards
 
-    def regrab(self, held):
+    def come_back(self, held):
+        """Switch away and back, with `held` still down on return."""
         self.session.set_foreground(False)
         self.keyboards.held = set(held)
         self.session.set_foreground(True)
 
-    def test_held_modifiers_are_adopted(self):
-        self.regrab({KEY_LEFTALT})
-        self.assertEqual(self.session.modifiers, keycodes.MOD_LEFTALT)
+    def key_comes_up(self):
+        """The release arriving on a keyboard btkey has not taken."""
+        self.keyboards.held = set()
+        waited = FakeDevice()
+        waited.grabbed = False          # which is what waiting on it means
+        self.session.on_device_input(waited.fd, None, waited)
 
-    def test_nothing_held_means_no_modifiers(self):
-        self.regrab(set())
+    def test_nothing_is_taken_while_a_key_is_down(self):
+        self.come_back({KEY_LEFTALT})
+        self.assertTrue(self.session.waiting_for_release)
+        self.assertFalse(self.keyboards.grabbed)
+
+    def test_nothing_held_is_taken_at_once(self):
+        self.come_back(set())
+        self.assertFalse(self.session.waiting_for_release)
+        self.assertTrue(self.keyboards.grabbed)
         self.assertEqual(self.session.modifiers, 0)
 
-    def test_held_letters_are_not_adopted_as_modifiers(self):
-        self.regrab({KEY_A, KEY_LEFTCTRL})
-        self.assertEqual(self.session.modifiers, keycodes.MOD_LEFTCTRL)
+    def test_the_key_waited_for_is_not_left_held(self):
+        """The reported bug: come back holding Alt, and Alt sticks.
 
-    def test_alt_survives_a_walk_through_other_consoles(self):
-        """The reported bug: hold Alt, press F2 F3 F4 F5, from tty4.
-
-        F2 switches away and we let go.  The kernel handles F3 and F4, so
-        we come back to our own console with Alt still down but its press
-        never seen.  F5 must still switch, not go to the phone.
+        Reading what is held belongs to the moment of taking the
+        keyboard.  Done at the switch instead, it adopted the very key
+        being waited on - Alt, nearly always, that being how the console
+        is reached - and every letter afterwards went to the phone as
+        Alt and the letter, until Alt was pressed and released again.
         """
-        press(self.session, KEY_LEFTALT)
-        press(self.session, KEY_F2)
-        self.assertEqual(self.session.consoles.switched, [2])
+        self.come_back({KEY_LEFTALT})
+        # What the bug left behind: Alt adopted at the switch, while it
+        # was still down and still the console's.  Whatever btkey thinks
+        # is held, taking the keyboard asks the keyboards afresh.
+        self.session.modifiers = keycodes.MOD_LEFTALT
+        self.key_comes_up()
+        self.assertTrue(self.keyboards.grabbed)
+        self.assertEqual(self.session.modifiers, 0)
 
-        self.regrab({KEY_LEFTALT})        # back on tty4, Alt still held
-        press(self.session, KEY_F5)
-        self.assertEqual(self.session.consoles.switched, [2, 5])
-        # Switching does send one report, releasing everything, so the test
-        # is that F5's usage never went out - not that nothing did.
-        sent = [usage for _, keys in self.link.reports for usage in keys]
-        self.assertNotIn(0x3E, sent,
-                         "F5 was forwarded to the phone instead of switching")
+    def test_the_lock_lights_are_written_once_it_is_taken(self):
+        # push_leds ran at the switch too, when nothing was grabbed yet,
+        # so it wrote to nothing and the deferred take never wrote at all.
+        self.session.leds = 0x02
+        self.come_back({KEY_LEFTALT})
+        self.keyboards.leds = None
+        self.key_comes_up()
+        self.assertEqual(self.keyboards.leds, 0x02)
+
+    def test_a_modifier_down_at_the_grab_is_still_adopted(self):
+        """The breath between the check and the grab.
+
+        Vanishingly unlikely, but asking is how it stays known about
+        rather than stuck, and it costs one ioctl per keyboard.
+        """
+        self.keyboards.held = {KEY_LEFTALT}
+        self.session.sync_modifiers()
+        self.assertEqual(self.session.modifiers, keycodes.MOD_LEFTALT)
+
+    def test_a_held_letter_is_not_a_modifier(self):
+        self.keyboards.held = {KEY_A}
+        self.session.sync_modifiers()
+        self.assertEqual(self.session.modifiers, 0)
 
 
 class InferredLockTest(unittest.TestCase):

@@ -2,6 +2,12 @@
 
 Newest first.
 
+## 0.1.5
+
+- Coming back to btkey's console while still holding Alt left Alt held,
+  so every letter reached the phone as Alt and the letter until Alt was
+  pressed and released again.  New in 0.1.4.
+
 ## 0.1.4
 
 - Using btkey could leave the console believing Ctrl was still held,

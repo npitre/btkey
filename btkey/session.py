@@ -582,6 +582,17 @@ class Session:
             self.keyboards.grab_all()
         self.watch_held_devices()
 
+        # Both of these are about the keyboards just taken, so they
+        # belong to the taking and not to the switch that asked for it.
+        # A take that waited for a key to come up happens later, from
+        # the input path: run at the switch, the first would adopt the
+        # very key being waited on - Alt, most of the time, that being
+        # how the console was reached - and hold it down for the rest of
+        # the session, while the second would write the phone's lock
+        # state to nothing at all.
+        self.sync_modifiers()
+        self.push_leds()
+
     def watch_every_device(self):
         """Watch them all, held or not, to see the last key come up.
 
@@ -695,8 +706,6 @@ class Session:
             self.wake_devices()
             self.rescan_devices()
             self.take_keyboards()
-            self.sync_modifiers()
-            self.push_leds()
             self.watch_myself()
         else:
             # And comes off before the keyboards go, for the same reason
@@ -714,11 +723,18 @@ class Session:
     def sync_modifiers(self):
         """Adopt the modifiers that are physically held, on taking the grab.
 
-        Holding Alt and walking through consoles with F2, F3, F4 lands back
-        here with Alt still down - but its press went to the kernel while we
-        were ungrabbed, so we never saw it.  Without asking the devices what
-        is held, the next Alt+Fn looks like a bare Fn and goes to the phone
-        instead of switching console.
+        Holding Alt and walking through consoles with F2, F3, F4 lands
+        back here with Alt still down - but its press went to the kernel
+        while we were ungrabbed, so we never saw it.  Without asking the
+        devices what is held, the next Alt+Fn looks like a bare Fn and
+        goes to the phone instead of switching console.
+
+        Since btkey waits for the keys to come up before taking a
+        keyboard, the answer at that moment is nearly always nothing,
+        and this is the clearing of whatever was left over.  Asking is
+        still the right way to arrive at that: a key pressed in the
+        breath between the check and the grab is held, and known about
+        here rather than stuck.
         """
         modifiers = 0
         for keycode in self.keyboards.held_keys():
