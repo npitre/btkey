@@ -46,6 +46,56 @@ by getting it wrong first, and the reasons are worth keeping.
 * Pasting is the one thing that is not layout-agnostic, so the phone's
   layout is measured rather than assumed: [LAYOUTS.md](LAYOUTS.md).
 
+## Why it runs as root
+
+Not because Bluetooth needs it.  Four things need it, or needed it, and
+no group grants any of them:
+
+* **Grabbing the keyboards.**  `EVIOCGRAB` on `/dev/input/event*`, which
+  is `root:input` mode 0660, so this is the one item a group really does
+  cover.  It is a larger thing to hand out than it sounds.  An evdev node
+  sits below the VT layer, below X and Wayland, and below any notion of
+  focus or of who is logged in, so anything the member runs can read
+  every key on the machine, including a root password typed at a sudo
+  prompt on another console.  That is exactly the power btkey uses, which
+  is the argument for taking it deliberately, for one program, rather
+  than holding it always, for every program.
+
+* **Binding L2CAP PSM 17 and 19.**  The HID profile fixes those two, they
+  are below 0x1000, and binding one there needs CAP_NET_BIND_SERVICE.  It
+  need not be btkey that binds them: bluetoothd will, for any client that
+  registers a profile with a `PSM` option, and it does so for an
+  unprivileged caller.  An ordinary uid registered both PSMs against a
+  bluetoothd started without its input plugin, and both were bound.  With
+  the plugin loaded neither is, and the only place that shows is
+  bluetoothd's log, because `RegisterProfile` returns success either way:
+
+  ```
+  src/profile.c:ext_start_servers() L2CAP server failed for ...:
+      l2cap_bind: Address already in use (98)
+  ```
+
+* **The private bluetoothd.**  Running one is root, and stopping the
+  system one to make room for it is root again.  The permanent
+  alternative in [SETUP.md](SETUP.md) turns that into a one-time setup,
+  at the price of the machine's Bluetooth HID host role.
+
+* **Writing the class of device.**  For `--audio` only, and the reason is
+  above.  A raw HCI socket lets an ordinary user read from the controller
+  but not command it: the write comes back EPERM without CAP_NET_RAW.
+
+The console is the one that no longer does.  `VT_GETSTATE` and
+`VT_ACTIVATE` are permitted on a console of one's own, and btkey holds
+its own `/dev/ttyN` rather than root's `/dev/tty0`; the switch wants
+either CAP_SYS_TTY_CONFIG or that the console be the caller's controlling
+terminal, which is the permission `chvt` has always run on.
+
+So an unprivileged btkey is not a fantasy: the permanent bluetoothd setup
+done once as root, membership of `input`, the two PSMs taken from
+bluetoothd rather than bound here, and no `--audio`.  Nobody has built
+it.  The `input` group is the part to think twice about, since it is
+permanent and it covers every process you run.
+
 ## Surviving a bad exit
 
 **Dying is safe by construction.**  `EVIOCGRAB` lives on the open file

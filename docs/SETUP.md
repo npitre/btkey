@@ -237,7 +237,31 @@ it still holds the keyboard the other console is being typed at.
 The VT layer notifies on `/sys/class/tty/tty0/active`, which names the
 console in front, so the question is waited on with `POLLPRI` instead of
 asked.  Asking is what btkey used to do, 25 times a second for as long as
-it ran.  A kernel without the attribute falls back to that.
+it ran, and it is still the fallback if the watch fails: the question has
+an answer either way, since asking is an ioctl rather than a read of the
+attribute.  A kernel with no attribute at all can still be told which
+console to use, with `--vt`.
+
+None of it needs a privileged console device.  `VT_GETSTATE` answers for
+the VT layer rather than for the console it is asked on, so the one btkey
+holds will do: its own `/dev/ttyN`, which belongs to whoever is logged in
+there, rather than `/dev/tty0`, which is root's alone.  That same
+descriptor does the `VT_ACTIVATE` of a switch and the `KDGKBENT` reads
+that build the console keymap.
+
+Which console is *ours* is a different question, and neither the ioctl
+nor the attribute answers it: both say which console is in front, and
+btkey can be started from one that is not.  Answering with the
+foreground console would grab a keyboard somebody else is typing at, and
+over ssh it would do that every time.
+
+So btkey works out where it was started, in this order: its controlling
+terminal, then its own three descriptors, then `SUDO_TTY`, which sudo
+sets to the terminal it was invoked from and which is the answer when
+sudo has put a pty in the way, and finally the processes above us, whose
+`/proc/pid/stat` still names the console the shell is on.  `su` and a
+plain root login land in that last case.  If none of them knows, btkey
+says so and stops rather than guessing; `--vt N` names one outright.
 
 The attribute has to be read once before it is watched, and again after
 every wakeup: an unread sysfs attribute is ready from the outset, so a

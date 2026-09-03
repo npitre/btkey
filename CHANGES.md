@@ -2,6 +2,16 @@
 
 Newest first.
 
+## 0.1.7
+
+- btkey uses the console it was started on rather than whichever one is
+  in front.  Started from a console you had switched away from, or over
+  ssh, it used to take the keyboard of the console someone was actually
+  using.  When it cannot tell where it was started it now says so
+  instead of guessing, and `--vt` names a console outright.
+
+- The documentation says what btkey needs root for, one item at a time.
+
 ## 0.1.6
 
 - btkey works on a Python that was built without Bluetooth support.
