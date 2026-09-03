@@ -50,6 +50,14 @@ def main(argv):
         say("no tests found in %s" % HERE)
         return 1
 
+    if os.geteuid() == 0:
+        # Not an error: the tests are written to be harmless either way.
+        # But the counts differ, and the reason is worth having in front
+        # of anyone reading the results.
+        say("note: running as root.  No test needs it, and the few that")
+        say("      are about not being root skip themselves.")
+        say("")
+
     width = max(len(os.path.basename(path)) for path in wanted)
     total, failures = 0, []
     started = time.monotonic()

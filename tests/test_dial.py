@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from gi.repository import GLib
 
-from btkey import btlink, hidspec
+from btkey import btlink, btsock, hidspec
 
 
 class FakeSocket:
@@ -56,8 +56,8 @@ class FakeSocket:
     def setblocking(self, flag):
         self.blocking = flag
 
-    def connect(self, target):
-        self.connected_to = target
+    def connect(self, where):
+        self.connected_to = where
         self.blocking_at_connect = self.blocking
         raise BlockingIOError(errno.EINPROGRESS, "in progress")
 
@@ -92,13 +92,18 @@ class DialTest(unittest.TestCase):
         self.link._adopt_interrupt = lambda sock: self.link.adopted.append(sock)
         self.link.last_host = lambda: "AA:BB:CC:DD:EE:FF"
 
-        self.saved_socket = btlink.socket.socket
-        btlink.socket.socket = self.next_socket
+        self.saved_socket = btlink.btsock.l2cap_socket
+        btlink.btsock.l2cap_socket = self.next_socket
+        # The real one goes to libc, which will have nothing to do with a
+        # pipe.  The fake raises what a dial to a sleeping phone raises.
+        self.saved_connect = btlink.btsock.connect
+        btlink.btsock.connect = lambda sock, where: sock.connect(where)
         self.saved_timeout = btlink.DIAL_TIMEOUT_MS
         btlink.DIAL_TIMEOUT_MS = 30
 
     def tearDown(self):
-        btlink.socket.socket = self.saved_socket
+        btlink.btsock.l2cap_socket = self.saved_socket
+        btlink.btsock.connect = self.saved_connect
         btlink.DIAL_TIMEOUT_MS = self.saved_timeout
         for sock in FakeSocket.made:
             sock.release()
@@ -141,10 +146,14 @@ class DialTest(unittest.TestCase):
         self.plan = [control, interrupt]
         self.link.reconnect()
         self.spin()
+        # The packed address itself, which is what the dial hands to the
+        # kernel; test_btsock.py is where the packing is held to account.
         self.assertEqual(control.connected_to,
-                         ("AA:BB:CC:DD:EE:FF", hidspec.PSM_CONTROL))
+                         btsock.l2cap_address("AA:BB:CC:DD:EE:FF",
+                                              hidspec.PSM_CONTROL))
         self.assertEqual(interrupt.connected_to,
-                         ("AA:BB:CC:DD:EE:FF", hidspec.PSM_INTERRUPT))
+                         btsock.l2cap_address("AA:BB:CC:DD:EE:FF",
+                                              hidspec.PSM_INTERRUPT))
         self.assertEqual(self.link.adopted, [control, interrupt])
         self.assertEqual(self.link.peer, "AA:BB:CC:DD:EE:FF")
 

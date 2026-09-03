@@ -2,6 +2,16 @@
 
 Newest first.
 
+## 0.1.6
+
+- btkey works on a Python that was built without Bluetooth support.
+  Some distributions ship one, and there btkey used to stop with an
+  error about AF_BLUETOOTH before it could do anything at all.
+
+- `make check` no longer touches the machine it runs on when it is run
+  as root.  It could stop the system's bluetooth service and install
+  btkey into /usr/local while it was only meant to be testing.
+
 ## 0.1.5
 
 - Coming back to btkey's console while still holding Alt left Alt held,

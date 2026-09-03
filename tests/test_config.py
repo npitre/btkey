@@ -9,6 +9,7 @@ of step with it.
 """
 
 import os
+import pwd
 import shutil
 import sys
 import tempfile
@@ -91,6 +92,27 @@ class ToArgumentsTest(unittest.TestCase):
         self.assertTrue(problems[0].startswith("2:"))
 
 
+def someone_else():
+    """A uid the passwd database really has, whose home is not ours.
+
+    Two things this has to be.  Real, because expand() looks the uid up,
+    and an invented one sends it down the path where it gives up and hands
+    the value back untouched.  And somebody other than whoever is running
+    the tests, because os.path.expanduser answers with the runner's own
+    home - so a stand-in that shares it would let the very mistake this is
+    about pass unnoticed.
+    """
+    mine = os.path.expanduser("~")
+    others = [entry for entry in sorted(pwd.getpwall(),
+                                        key=lambda entry: entry.pw_uid)
+              if entry.pw_uid and entry.pw_dir.startswith("/")
+              and entry.pw_dir != mine]
+    homely = [entry for entry in others if entry.pw_dir.startswith("/home/")]
+    for entry in homely + others:
+        return entry
+    return None
+
+
 class ExpandTest(unittest.TestCase):
     """A leading ~ in a config file, which no shell ever sees.
 
@@ -100,15 +122,21 @@ class ExpandTest(unittest.TestCase):
     """
 
     def setUp(self):
-        os.environ["SUDO_UID"], os.environ["SUDO_GID"] = "1000", "1000"
+        self.user = someone_else()
+        if self.user is None:
+            self.skipTest("nobody in the passwd database to stand in for "
+                          "whoever ran sudo")
+        os.environ["SUDO_UID"] = str(self.user.pw_uid)
+        os.environ["SUDO_GID"] = str(self.user.pw_gid)
         self.addCleanup(os.environ.pop, "SUDO_UID", None)
         self.addCleanup(os.environ.pop, "SUDO_GID", None)
 
     def test_it_expands_against_the_invoking_user(self):
         expanded = config.expand("~/.config/btkey/layout.conf")
-        self.assertTrue(expanded.startswith("/"))
+        self.assertEqual(
+            expanded,
+            os.path.join(self.user.pw_dir, ".config/btkey/layout.conf"))
         self.assertNotIn("/root/", expanded)
-        self.assertTrue(expanded.endswith("/.config/btkey/layout.conf"))
 
     def test_an_absolute_path_is_untouched(self):
         self.assertEqual(config.expand("/etc/btkey/x.conf"),
@@ -122,8 +150,7 @@ class ExpandTest(unittest.TestCase):
 
     def test_values_from_a_file_are_expanded(self):
         args, _ = config.to_arguments("phone-layout = ~/x.conf\n", {})
-        self.assertTrue(args[1].startswith("/"))
-        self.assertTrue(args[1].endswith("/x.conf"))
+        self.assertEqual(args[1], os.path.join(self.user.pw_dir, "x.conf"))
 
 
 class FlagDetectionTest(unittest.TestCase):

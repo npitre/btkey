@@ -592,6 +592,26 @@ class SecondInstanceTest(unittest.TestCase):
         self.addCleanup(setattr, cli.os, "geteuid", saved_uid)
         self.saved_hold = cli.single.hold
         self.addCleanup(setattr, cli.single, "hold", self.saved_hold)
+        # The console is where main() stops once it is past the lock, and
+        # it has to stop somewhere: run as root on a machine that has a
+        # console, the rest of main() starts a real bluetoothd and takes
+        # the system's bluetooth.service down underneath it.
+        saved_consoles = cli.vt.Consoles
+        cli.vt.Consoles = self.no_console
+        self.addCleanup(setattr, cli.vt, "Consoles", saved_consoles)
+        # And if it ever gets past the console anyway, say so here rather
+        # than in the shape of a machine with no Bluetooth left.
+        saved_spawn = cli.guardian.spawn
+        cli.guardian.spawn = self.no_guardian
+        self.addCleanup(setattr, cli.guardian, "spawn", saved_spawn)
+
+    @staticmethod
+    def no_console(*args, **kwargs):
+        raise cli.vt.NoConsole("no virtual terminal to speak of")
+
+    @staticmethod
+    def no_guardian(*args, **kwargs):
+        raise AssertionError("main() carried on past the console")
 
     def test_it_stops_when_another_holds_the_lock(self):
         cli.single.hold = lambda who="", **kw: (None, "pid 999, started by nico")
@@ -603,8 +623,16 @@ class SecondInstanceTest(unittest.TestCase):
     def test_it_stops_before_opening_a_console(self):
         # The console is the next thing tried, and its failure is what
         # would be reported instead if the lock were checked after it.
+        opened = []
+
+        def note_and_refuse(*args, **kwargs):
+            opened.append(True)
+            raise cli.vt.NoConsole("no virtual terminal to speak of")
+
+        cli.vt.Consoles = note_and_refuse
         cli.single.hold = lambda who="", **kw: (None, "")
         cli.main(["--no-config"])
+        self.assertEqual(opened, [])
         self.assertNotIn("virtual terminal", self.errors.getvalue())
 
     def test_holding_the_lock_lets_it_carry_on(self):
@@ -612,7 +640,7 @@ class SecondInstanceTest(unittest.TestCase):
         cli.single.hold = lambda who="", **kw: (taken.append(who) or 7, None)
         cli.main(["--no-config"])
         self.assertEqual(len(taken), 1)
-        # Far enough to try the console, which is not there in a test.
+        # Far enough to try the console, which setUp refuses.
         self.assertIn("virtual terminal", self.errors.getvalue())
 
     def test_it_says_who_is_asking(self):

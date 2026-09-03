@@ -29,7 +29,7 @@ import dbus.mainloop.glib
 import dbus.service
 from gi.repository import GLib
 
-from . import fifo, hidspec
+from . import btsock, fifo, hidspec
 
 BLUEZ = "org.bluez"
 ADAPTER_IFACE = "org.bluez.Adapter1"
@@ -115,13 +115,12 @@ def describe(exc):
 
 
 def _listener(psm):
-    sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET,
-                         socket.BTPROTO_L2CAP)
+    sock = btsock.l2cap_socket()
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(SOL_BLUETOOTH, BT_SECURITY,
                     struct.pack("BB", BT_SECURITY_MEDIUM, 0))
     try:
-        sock.bind(("00:00:00:00:00:00", psm))
+        btsock.bind(sock, btsock.l2cap_address(btsock.BDADDR_ANY, psm))
     except OSError as exc:
         sock.close()
         if exc.errno == 98:      # EADDRINUSE
@@ -632,14 +631,13 @@ class BluetoothHID:
 
     def _on_incoming(self, fd, condition, psm):
         try:
-            conn, address = self._listeners[psm].accept()
+            conn, peer = btsock.accept(self._listeners[psm])
         except OSError as exc:
             if not fifo.keep_watching(exc):
                 self.event("listener on PSM %d failed: %s"
                            % (psm, exc.strerror))
                 return False
             return True
-        peer = address[0]
 
         if self.peer is not None and peer != self.peer:
             self.event("refusing second host %s" % peer)
@@ -771,13 +769,12 @@ class BluetoothHID:
         was meant to wake the phone up.
         """
         try:
-            sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET,
-                                 socket.BTPROTO_L2CAP)
+            sock = btsock.l2cap_socket()
             sock.setsockopt(SOL_BLUETOOTH, BT_SECURITY,
                             struct.pack("BB", BT_SECURITY_MEDIUM, 0))
             sock.setblocking(False)
             try:
-                sock.connect((addr, psm))
+                btsock.connect(sock, btsock.l2cap_address(addr, psm))
             except BlockingIOError:
                 pass                       # the usual case: still dialling
         except OSError as exc:

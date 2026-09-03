@@ -185,25 +185,63 @@ class UserInstallTest(unittest.TestCase):
     run by the person at the keyboard.
 
     HOME is pointed somewhere disposable, so these never write to a real
-    one.
+    one, and the prefix is spelled out rather than left to the Makefile:
+    its default under root is /usr/local, so `sudo make check` would
+    otherwise install btkey over the machine running the tests.
     """
 
     def setUp(self):
         self.home = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
 
-    def install(self, *extra):
-        environment = dict(os.environ, HOME=self.home)
-        result = subprocess.run(["make", "-C", ROOT, "install"] + list(extra),
+    def make(self, target, *extra, **environment):
+        """One make run in the disposable HOME, with the prefix pinned.
+
+        Keyword arguments are environment variables; positional ones are
+        make variables, and a PREFIX among them wins over the pinned one.
+        """
+        if not any(argument.startswith("PREFIX=") for argument in extra):
+            extra = ("PREFIX=" + os.path.join(self.home, ".local"),) + extra
+        result = subprocess.run(["make", "-C", ROOT, target] + list(extra),
                                 capture_output=True, text=True,
-                                env=environment)
+                                env=dict(os.environ, HOME=self.home,
+                                         **environment))
+        return result
+
+    def install(self, *extra, **environment):
+        result = self.make("install", *extra, **environment)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
 
+    def test_the_default_prefix_is_usr_local_for_root(self):
+        """Which is why every other test here spells the prefix out: left
+        to the Makefile, `make check` under sudo installs btkey over the
+        machine running the tests.
+
+        `id` is stubbed rather than the test run as root, so the decision
+        is checked whoever runs it.
+        """
+        stub = os.path.join(self.home, "stub")
+        os.makedirs(stub)
+        with open(os.path.join(stub, "id"), "w") as handle:
+            handle.write("#!/bin/sh\necho 0\n")
+        os.chmod(os.path.join(stub, "id"), 0o755)
+        result = subprocess.run(
+            ["make", "-C", ROOT, "help"], capture_output=True, text=True,
+            env=dict(os.environ, HOME=self.home,
+                     PATH=stub + os.pathsep + os.environ["PATH"]))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("install into /usr/local", result.stdout)
+
+    @unittest.skipIf(os.geteuid() == 0,
+                     "the default prefix under root is /usr/local")
     def test_the_default_prefix_is_under_home_when_not_root(self):
         # Rather than /usr/local, which a user cannot write to, so that
         # plain `make install` does something useful instead of failing.
-        self.install()
+        result = subprocess.run(["make", "-C", ROOT, "install"],
+                                capture_output=True, text=True,
+                                env=dict(os.environ, HOME=self.home))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(os.path.exists(
             os.path.join(self.home, ".local/bin/btkey")))
 
@@ -234,6 +272,8 @@ class UserInstallTest(unittest.TestCase):
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    @unittest.skipIf(os.geteuid() == 0,
+                     "the note is for a user install, and this is not one")
     def test_it_says_that_running_it_still_needs_root(self):
         # The trap in a user install: sudo will never look in ~/bin, so
         # `sudo btkey` fails with nothing but "command not found".
@@ -245,26 +285,17 @@ class UserInstallTest(unittest.TestCase):
     def test_it_says_when_the_launcher_will_not_be_on_the_path(self):
         # A launcher nobody can invoke by name is the whole point missed,
         # and nothing else would have said so.
-        environment = dict(os.environ, HOME=self.home, PATH="/usr/bin:/bin")
-        result = subprocess.run(["make", "-C", ROOT, "install"],
-                                capture_output=True, text=True,
-                                env=environment)
+        result = self.install(PATH="/usr/bin:/bin")
         self.assertIn("not on your PATH", result.stdout)
 
     def test_it_keeps_quiet_when_the_path_is_already_right(self):
         target = os.path.join(self.home, ".local/bin")
-        environment = dict(os.environ, HOME=self.home,
-                           PATH=target + ":/usr/bin:/bin")
-        result = subprocess.run(["make", "-C", ROOT, "install"],
-                                capture_output=True, text=True,
-                                env=environment)
+        result = self.install(PATH=target + ":/usr/bin:/bin")
         self.assertNotIn("not on your PATH", result.stdout)
 
     def test_uninstall_finds_the_same_place_the_install_used(self):
         self.install()
-        environment = dict(os.environ, HOME=self.home)
-        subprocess.run(["make", "-C", ROOT, "uninstall"],
-                       capture_output=True, text=True, env=environment)
+        self.make("uninstall")
         self.assertFalse(os.path.exists(
             os.path.join(self.home, ".local/bin/btkey")))
 

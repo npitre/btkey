@@ -222,6 +222,7 @@ None need root, a phone, or a Bluetooth controller.
 | `btlink.py` | SDP record, pairing agent, L2CAP, the HIDP control channel |
 | `evdev.py` | device discovery, grab, key and LED state |
 | `btd.py` | the private bluetoothd |
+| `btsock.py` | Bluetooth addresses, packed here rather than by the socket module |
 | `probe.py` | measuring the phone's layout |
 | `sweep.py` | typing a probe at the phone, and saying how far it has got |
 | `guardian.py` | cleanup and the watchdog, for when btkey dies badly |

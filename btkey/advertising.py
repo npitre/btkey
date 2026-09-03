@@ -24,12 +24,11 @@ since its last run and says so.
 """
 
 import os
-import socket
 import struct
 
 from gi.repository import GLib
 
-from . import hidspec
+from . import btsock, hidspec
 
 # How often to check that bluetoothd has not overwritten the class.  The
 # PropertiesChanged watch is the real mechanism; this is a backstop for a
@@ -69,13 +68,12 @@ class ClassOfDevice:
         packet = struct.pack("<BHB3s", self.HCI_COMMAND_PKT, opcode, 3,
                              cod.to_bytes(3, "little"))
         try:
-            sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW,
-                                 socket.BTPROTO_HCI)
+            sock = btsock.hci_socket()
         except OSError as exc:
             self.event("cannot open an HCI socket: %s" % exc.strerror)
             return False
         try:
-            sock.bind((self.index,))
+            btsock.bind(sock, btsock.hci_address(self.index))
             sock.send(packet)
             return True
         except OSError as exc:
